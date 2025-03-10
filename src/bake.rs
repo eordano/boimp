@@ -691,7 +691,7 @@ pub fn extract_imposter_cameras(
 
     for (entity, camera, channel, expected_count, gt, visible_entities) in cameras.iter() {
         if camera.state != BakeState::Rendering
-            || !channel.receiver.as_ref().map_or(true, |r| r.is_empty())
+            || !channel.receiver.as_ref().is_none_or(|r| r.is_empty())
         {
             continue;
         }

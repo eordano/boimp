@@ -508,6 +508,7 @@ fn impost(
                             settings.multisample_target,
                             false,
                             1.0,
+                            0.99,
                         ),
                         pixels: camera.target.clone().unwrap(),
                         indices: dummy_indices.0.clone(),

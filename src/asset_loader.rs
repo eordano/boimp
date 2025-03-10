@@ -33,6 +33,7 @@ pub struct ImposterLoaderSettings {
     // roughly alpha mode. 0 -> Blend, 1 -> Opaque, (0-1) -> Mask
     // if you need more control you can modify the loaded asset (we can't put actual alpha mode here because it doesn't serialize)
     pub alpha_blend: f32,
+    pub multisample_amount: f32,
 }
 
 impl Default for ImposterLoaderSettings {
@@ -41,6 +42,7 @@ impl Default for ImposterLoaderSettings {
             multisample: Default::default(),
             alpha: 1.0,
             alpha_blend: 0.0,
+            multisample_amount: 0.99,
         }
     }
 }
@@ -234,6 +236,7 @@ impl AssetLoader for ImposterLoader {
                     base_tile_size,
                     packed_tile_offset,
                     packed_tile_size,
+                    multisample_amount: (1.0 - load_settings.multisample_amount).clamp(0.0, 0.99),
                 },
                 pixels: pixels_image,
                 indices: indices_image,

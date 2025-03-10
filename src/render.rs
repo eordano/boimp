@@ -74,6 +74,7 @@ pub struct ImposterData {
     pub base_tile_size: u32,
     pub flags: u32,
     pub alpha: f32,
+    pub multisample_amount: f32,
 }
 
 impl ImposterData {
@@ -89,6 +90,7 @@ impl ImposterData {
         multisample: bool,
         indexed: bool,
         alpha: f32,
+        multisample_amount: f32,
     ) -> Self {
         Self {
             center_and_scale: center.extend(scale),
@@ -104,6 +106,7 @@ impl ImposterData {
                 }
                 + if indexed { INDEXED_FLAG } else { 0 },
             alpha,
+            multisample_amount,
         }
     }
 }

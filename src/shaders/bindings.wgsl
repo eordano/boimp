@@ -205,7 +205,7 @@ fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offse
         let pixel_bl_depth = single_sample(coords_unadjusted + vec2(0.0, 1.0), bounds_min, bounds_max);
         let pixel_br_depth = single_sample(coords_unadjusted + vec2(1.0, 1.0), bounds_min, bounds_max);
 
-        let frac = fract(coords_unadjusted);
+        let frac = clamp((fract(coords_unadjusted) - (imposter_data.multisample_amount / 2.0)) / (1.0 - imposter_data.multisample_amount), vec2(0.0), vec2(1.0));
         let pixel_top_depth = weighted_props(pixel_tl_depth, pixel_tr_depth, 1.0 - frac.x);
         let pixel_bottom_depth = weighted_props(pixel_bl_depth, pixel_br_depth, 1.0 - frac.x);
         let pixel_depth = weighted_props(pixel_top_depth, pixel_bottom_depth, 1.0 - frac.y);
@@ -219,10 +219,11 @@ fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offse
         let pixel_bl = single_sample(coords + vec2(0.0, 1.0), bounds_min, bounds_max);
         let pixel_br = single_sample(coords + vec2(1.0, 1.0), bounds_min, bounds_max);
 
-        let frac2 = fract(coords);
+        let frac2 = clamp((fract(coords) - (imposter_data.multisample_amount / 2.0)) / (1.0 - imposter_data.multisample_amount), vec2(0.0), vec2(1.0));
         let pixel_top = weighted_props(pixel_tl, pixel_tr, 1.0 - frac2.x);
         let pixel_bottom = weighted_props(pixel_bl, pixel_br, 1.0 - frac2.x);
-        let pixel = weighted_props(pixel_top, pixel_bottom, 1.0 - frac2.y);
+        var pixel = weighted_props(pixel_top, pixel_bottom, 1.0 - frac2.y);
+
         return pixel;
 #else
         let pixel_depth = single_sample(coords_unadjusted, bounds_min, bounds_max);

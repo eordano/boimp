@@ -18,6 +18,7 @@ struct ImposterData {
     base_tile_size: u32,
     flags: u32,
     alpha: f32,
+    multisample_amount: f32,
 }
 
 struct ImposterVertexOut {
