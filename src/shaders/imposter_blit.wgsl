@@ -3,6 +3,9 @@
 
 struct BlitData {
     samples: u32,
+    pad_0: u32,
+    pad_1: u32,
+    pad_2: u32,
 }
 
 @group(0) @binding(0) var source: texture_2d<u32>;

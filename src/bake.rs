@@ -921,6 +921,9 @@ where
 #[derive(ShaderType)]
 pub struct BlitUniform {
     samples: u32,
+    pad_0: u32,
+    pad_1: u32,
+    pad_2: u32,
 }
 
 #[derive(Resource)]
@@ -1043,6 +1046,9 @@ pub fn prepare_imposter_textures(
                 };
                 let mut buffer: UniformBuffer<BlitUniform> = UniformBuffer::from(BlitUniform {
                     samples: camera.multisample,
+                    pad_0: 0,
+                    pad_1: 0,
+                    pad_2: 0,
                 });
                 buffer.write_buffer(&device, &queue);
 
