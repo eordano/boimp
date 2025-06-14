@@ -49,50 +49,42 @@ fn setup(
     }
     let mesh = meshes.add(mesh);
     commands.spawn((
-        MaterialMeshBundle::<Imposter> {
-            mesh,
-            transform: Transform::from_translation(Vec3::Y * 23.219)
-                .with_scale(Vec3::new(32.0, 46.42, 32.0)),
-            material: asset_server.load_with_settings::<_, ImposterLoaderSettings>(
-                source,
-                move |s| {
-                    s.multisample = multisample;
-                },
-            ),
-            ..default()
-        },
+        Mesh3d(mesh),
+        Transform::from_translation(Vec3::Y * 23.219).with_scale(Vec3::new(32.0, 46.42, 32.0)),
+        MeshMaterial3d::<Imposter>(
+            asset_server.load_with_settings::<_, ImposterLoaderSettings>(source, move |s| {
+                s.multisample = multisample;
+            }),
+        ),
         Rotate,
     ));
 
-    commands
-        .spawn(Camera3dBundle {
-            transform: Transform::from_translation(Vec3::ONE).looking_at(Vec3::ZERO, Vec3::Y),
-            ..Default::default()
-        })
-        .insert(CameraController {
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_translation(Vec3::ONE).looking_at(Vec3::ZERO, Vec3::Y),
+        CameraController {
             walk_speed: 15.0,
             run_speed: 45.0,
             ..default()
-        });
+        },
+    ));
 
-    commands.spawn(PbrBundle {
-        mesh: meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(16.0))),
-        material: mats.add(StandardMaterial::from(Color::srgb(0.0, 1.0, 0.0))),
-        ..Default::default()
-    });
+    commands.spawn((
+        Mesh3d(meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(16.0)))),
+        MeshMaterial3d(mats.add(StandardMaterial::from(Color::srgb(0.0, 1.0, 0.0)))),
+    ));
 
-    commands.spawn(PbrBundle {
-        mesh: meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(32.0))),
-        material: mats.add(StandardMaterial::from(Color::srgb(0.0, 0.0, 1.0))),
-        transform: Transform::from_translation(Vec3::Y * -0.01),
-        ..Default::default()
-    });
+    commands.spawn((
+        Mesh3d(meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(32.0)))),
+        MeshMaterial3d(mats.add(StandardMaterial::from(Color::srgb(0.0, 0.0, 1.0)))),
+        Transform::from_translation(Vec3::Y * -0.01),
+    ));
 
-    commands.spawn(DirectionalLightBundle::default());
+    commands.spawn(DirectionalLight::default());
 }
 
 fn set_camera_pos(
-    handles: Query<&Handle<Imposter>>,
+    handles: Query<&MeshMaterial3d<Imposter>>,
     imposters: Res<Assets<Imposter>>,
     mut cam: Query<&mut Transform, With<Camera>>,
     asset_server: Res<AssetServer>,
@@ -135,7 +127,7 @@ fn rotate(
     }
 
     if *rot {
-        *accrued += time.delta_seconds();
+        *accrued += time.delta_secs();
         for mut t in q.iter_mut() {
             t.rotation = Quat::from_rotation_y(*accrued * 0.2);
         }

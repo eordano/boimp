@@ -26,6 +26,7 @@ fn main() {
         .insert_resource(AmbientLight {
             color: Color::WHITE,
             brightness: 0.0,
+            affects_lightmapped_meshes: true,
         })
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
@@ -176,10 +177,10 @@ fn scene_load_check(
                     );
 
                     let root = commands
-                        .spawn(SpatialBundle {
-                            transform: Transform::from_scale(Vec3::splat(1.0)),
-                            ..Default::default()
-                        })
+                        .spawn((
+                            Transform::from_scale(Vec3::splat(1.0)),
+                            Visibility::default(),
+                        ))
                         // .insert(Rotate)
                         .id();
                     scene_handle.instance_id =
@@ -208,7 +209,7 @@ fn setup_scene_after_load(
     mut commands: Commands,
     mut setup: Local<bool>,
     mut scene_handle: ResMut<SceneHandle>,
-    meshes: Query<(&GlobalTransform, Option<&Aabb>), With<Handle<Mesh>>>,
+    meshes: Query<(&GlobalTransform, Option<&Aabb>), With<Mesh3d>>,
     scene_spawner: Res<SceneSpawner>,
     settings: Res<BakeSettings>,
 ) {

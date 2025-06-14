@@ -6,17 +6,16 @@ use std::f32::consts::{FRAC_PI_4, PI};
 
 use bevy::{
     animation::AnimationTarget,
-    asset::LoadState,
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     ecs::entity::EntityHashMap,
     math::FloatOrd,
+    platform::collections::HashMap,
     prelude::*,
     render::{
         primitives::{Aabb, Sphere},
         view::RenderLayers,
     },
     scene::InstanceId,
-    utils::hashbrown::HashMap,
 };
 use boimp::{
     render::DummyIndicesImage, GridMode, Imposter, ImposterBakeBundle, ImposterBakeCamera,
@@ -47,6 +46,7 @@ fn main() {
         .insert_resource(AmbientLight {
             color: Color::WHITE,
             brightness: 0.0,
+            ..default()
         })
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
@@ -59,7 +59,10 @@ fn main() {
             CameraControllerPlugin,
             ImposterBakePlugin,
         ))
-        .add_plugins((FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin::default()))
+        .add_plugins((
+            FrameTimeDiagnosticsPlugin::default(),
+            LogDiagnosticsPlugin::default(),
+        ))
         .add_systems(Startup, setup)
         .add_systems(PreUpdate, setup_scene_after_load)
         .add_systems(
@@ -172,7 +175,10 @@ fn scene_load_check(
 ) {
     match scene_handle.instance_id {
         None => {
-            if asset_server.load_state(&scene_handle.gltf_handle) == LoadState::Loaded {
+            if asset_server
+                .load_state(&scene_handle.gltf_handle)
+                .is_loaded()
+            {
                 let gltf = gltf_assets.get(&scene_handle.gltf_handle).unwrap();
                 if gltf.scenes.len() > 1 {
                     info!(
@@ -205,10 +211,10 @@ fn scene_load_check(
                         });
 
                 let root = commands
-                    .spawn(SpatialBundle {
-                        transform: Transform::from_scale(Vec3::splat(1.0)),
-                        ..Default::default()
-                    })
+                    .spawn((
+                        Transform::from_scale(Vec3::splat(1.0)),
+                        Visibility::default(),
+                    ))
                     .id();
                 scene_handle.instance_id =
                     Some(scene_spawner.spawn_as_child(gltf_scene_handle.clone_weak(), root));
@@ -230,7 +236,7 @@ fn setup_anim_after_load(
     mut setup: Local<bool>,
     mut players: Query<&mut AnimationPlayer>,
     targets: Query<(Entity, &AnimationTarget)>,
-    parents: Query<&Parent>,
+    parents: Query<&ChildOf>,
     scene_handle: Res<SceneHandle>,
     clips: Res<Assets<AnimationClip>>,
     gltf_assets: Res<Assets<Gltf>>,
@@ -291,7 +297,7 @@ fn setup_anim_after_load(
                 }
 
                 // Go to the next parent.
-                current = parents.get(entity).ok().map(|parent| parent.get());
+                current = parents.get(entity).ok().map(|parent| parent.parent());
             }
         }
 
@@ -321,7 +327,9 @@ fn setup_anim_after_load(
         };
         let graph = graphs.add(graph);
         player.play(clips[0]).repeat();
-        commands.entity(player_entity).insert(graph);
+        commands
+            .entity(player_entity)
+            .insert(AnimationGraphHandle(graph));
     }
 }
 
@@ -329,7 +337,7 @@ fn setup_scene_after_load(
     mut commands: Commands,
     mut setup: Local<bool>,
     mut scene_handle: ResMut<SceneHandle>,
-    meshes: Query<(&GlobalTransform, Option<&Aabb>), With<Handle<Mesh>>>,
+    meshes: Query<(&GlobalTransform, Option<&Aabb>), With<Mesh3d>>,
     scene_spawner: Res<SceneSpawner>,
 ) {
     if scene_handle.is_loaded && !*setup {
@@ -399,16 +407,12 @@ fn setup_scene_after_load(
         info!("{:?}", *scene_handle);
 
         commands.spawn((
-            Camera3dBundle {
-                projection: projection.into(),
-                transform: Transform::from_translation(
-                    Vec3::from(aabb.center) + size * Vec3::new(0.5, 0.25, 0.5),
-                )
+            Camera3d::default(),
+            Projection::from(projection),
+            Transform::from_translation(Vec3::from(aabb.center) + size * Vec3::new(0.5, 0.25, 0.5))
                 .looking_at(Vec3::from(aabb.center), Vec3::Y),
-                camera: Camera {
-                    is_active: true,
-                    ..default()
-                },
+            Camera {
+                is_active: true,
                 ..default()
             },
             camera_controller,
@@ -419,10 +423,8 @@ fn setup_scene_after_load(
         if !scene_handle.has_light {
             info!("Spawning a directional light");
             commands.spawn((
-                DirectionalLightBundle {
-                    transform: Transform::from_xyz(1.0, 1.0, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
-                    ..default()
-                },
+                DirectionalLight::default(),
+                Transform::from_xyz(1.0, 1.0, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
                 RenderLayers::default().with(1),
             ));
 
@@ -445,7 +447,7 @@ fn impost(
     if k.just_pressed(KeyCode::KeyO) {
         for entity in cams.iter() {
             println!("stopping imposter baking");
-            commands.entity(entity).despawn_recursive();
+            commands.entity(entity).despawn();
         }
     }
 
@@ -485,38 +487,33 @@ fn impost(
                 rng.gen_range(rotate_range.clone()) * hemi_mult,
             );
             commands.spawn((
-                MaterialMeshBundle {
-                    mesh: meshes.add(Plane3d::new(Vec3::Z, Vec2::splat(0.5))),
-                    transform: Transform::from_translation(
-                        translation + Vec3::from(scene_handle.sphere.center),
-                    )
+                Mesh3d(meshes.add(Plane3d::new(Vec3::Z, Vec2::splat(0.5)))),
+                Transform::from_translation(translation + Vec3::from(scene_handle.sphere.center))
                     .with_rotation(Quat::from_euler(
                         EulerRot::XYZ,
                         rotation.x,
                         rotation.y,
                         rotation.z,
                     )),
-                    material: materials.add(Imposter {
-                        data: ImposterData::new(
-                            Vec3::ZERO,
-                            scene_handle.sphere.radius,
-                            settings.grid_size,
-                            settings.tile_size,
-                            UVec2::ZERO,
-                            UVec2::splat(settings.tile_size),
-                            settings.mode,
-                            settings.multisample_target,
-                            false,
-                            1.0,
-                            0.99,
-                        ),
-                        pixels: camera.target.clone().unwrap(),
-                        indices: dummy_indices.0.clone(),
-                        alpha_mode: AlphaMode::Blend,
-                        vram_bytes: 0,
-                    }),
-                    ..Default::default()
-                },
+                MeshMaterial3d::<Imposter>(materials.add(Imposter {
+                    data: ImposterData::new(
+                        Vec3::ZERO,
+                        scene_handle.sphere.radius,
+                        settings.grid_size,
+                        settings.tile_size,
+                        UVec2::ZERO,
+                        UVec2::splat(settings.tile_size),
+                        settings.mode,
+                        settings.multisample_target,
+                        false,
+                        1.0,
+                        0.99,
+                    ),
+                    pixels: camera.target.clone().unwrap(),
+                    indices: dummy_indices.0.clone(),
+                    alpha_mode: AlphaMode::Blend,
+                    vram_bytes: 0,
+                })),
                 RenderLayers::layer(1),
             ));
         }
@@ -549,7 +546,7 @@ fn update_lights(
             transform.rotation = Quat::from_euler(
                 EulerRot::ZYX,
                 0.0,
-                time.elapsed_seconds() * PI / 15.0,
+                time.elapsed_secs() * PI / 15.0,
                 -FRAC_PI_4,
             );
         }
@@ -561,7 +558,7 @@ pub struct Rotate;
 
 fn rotate(mut q: Query<&mut Transform, With<Rotate>>, time: Res<Time>) {
     for mut t in q.iter_mut() {
-        t.rotation = Quat::from_rotation_y(time.elapsed_seconds());
+        t.rotation = Quat::from_rotation_y(time.elapsed_secs());
     }
 }
 

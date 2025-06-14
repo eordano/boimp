@@ -111,9 +111,9 @@ fn run_camera_controller(
     mut mouse_cursor_grab: Local<bool>,
     mut query: Query<(&mut Transform, &mut CameraController), With<Camera>>,
 ) {
-    let dt = time.delta_seconds();
+    let dt = time.delta_secs();
 
-    if let Ok((mut transform, mut controller)) = query.get_single_mut() {
+    if let Ok((mut transform, mut controller)) = query.single_mut() {
         if !controller.initialized {
             let (yaw, pitch, _roll) = transform.rotation.to_euler(EulerRot::YXZ);
             controller.yaw = yaw;
@@ -202,13 +202,13 @@ fn run_camera_controller(
                         continue;
                     }
 
-                    window.cursor.grab_mode = CursorGrabMode::Locked;
-                    window.cursor.visible = false;
+                    window.cursor_options.grab_mode = CursorGrabMode::Locked;
+                    window.cursor_options.visible = false;
                 }
             } else {
                 for mut window in &mut windows {
-                    window.cursor.grab_mode = CursorGrabMode::None;
-                    window.cursor.visible = true;
+                    window.cursor_options.grab_mode = CursorGrabMode::None;
+                    window.cursor_options.visible = true;
                 }
             }
         }

@@ -1,4 +1,5 @@
 use std::{
+    any::TypeId,
     ffi::OsStr,
     hash::Hash,
     marker::PhantomData,
@@ -8,26 +9,31 @@ use std::{
 };
 
 use bevy::{
-    asset::load_internal_asset,
+    asset::{load_internal_asset, weak_handle},
     core_pipeline::{
-        core_3d::{AlphaMask3d, Opaque3d, Opaque3dBinKey, Transparent3d},
+        core_3d::{AlphaMask3d, Opaque3d, Opaque3dBatchSetKey, Opaque3dBinKey, Transparent3d},
         fullscreen_vertex_shader::fullscreen_shader_vertex_state,
-        prepass::OpaqueNoLightmap3dBinKey,
+        prepass::{OpaqueNoLightmap3dBatchSetKey, OpaqueNoLightmap3dBinKey},
     },
-    ecs::{entity::EntityHashSet, query::QueryFilter, system::lifetimeless::SRes},
+    diagnostic::FrameCount,
+    ecs::system::lifetimeless::SRes,
+    image::{ImageSampler, TextureFormatPixelInfo},
     pbr::{
         alpha_mode_pipeline_key, graph::NodePbr, prepare_preprocess_bind_groups, DrawMesh,
-        ExtendedMaterial, GpuPreprocessNode, MaterialExtension, MaterialPipelineKey, MeshPipeline,
-        MeshPipelineKey, PreparedMaterial, PrepassPipeline, PreprocessBindGroup,
+        EarlyGpuPreprocessNode, ExtendedMaterial, LateGpuPreprocessNode,
+        MaterialBindGroupAllocator, MaterialExtension, MaterialPipelineKey, MeshPipeline,
+        MeshPipelineKey, PreparedMaterial, PrepassPipeline, PreprocessBindGroups,
         RenderMaterialInstances, RenderMeshInstances, SetMaterialBindGroup, SetMeshBindGroup,
         SetPrepassViewBindGroup, SkipGpuPreprocess,
     },
+    platform::collections::{HashMap, HashSet},
     prelude::*,
     render::{
+        batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
         camera::{
             CameraOutputMode, CameraProjection, CameraRenderGraph, ExtractedCamera, ScalingMode,
         },
-        mesh::GpuMesh,
+        mesh::{allocator::MeshAllocator, RenderMesh},
         primitives::{Aabb, Sphere},
         render_asset::{prepare_assets, RenderAssetUsages, RenderAssets},
         render_graph::{RenderGraphApp, RenderLabel, RenderSubGraph, ViewNode, ViewNodeRunner},
@@ -48,17 +54,19 @@ use bevy::{
             TextureFormat, TextureUsages, UniformBuffer,
         },
         renderer::{RenderDevice, RenderQueue},
-        texture::{ColorAttachment, GpuImage, ImageSampler, TextureCache, TextureFormatPixelInfo},
+        sync_world::{MainEntity, RenderEntity, SyncToRenderWorld},
+        texture::{ColorAttachment, GpuImage, TextureCache},
         view::{
-            ColorGrading, ExtractedView, NoFrustumCulling, RenderLayers, ViewDepthTexture,
-            ViewUniformOffset, VisibilitySystems, VisibleEntities, WithMesh,
+            ColorGrading, ExtractedView, NoFrustumCulling, NoIndirectDrawing,
+            PreviousVisibleEntities, RenderLayers, RenderVisibleEntities, RetainedViewEntity,
+            ViewDepthTexture, ViewUniformOffset, VisibilitySystems, VisibleEntities,
         },
-        Extract, Render, RenderApp, RenderSet,
+        Extract, Render, RenderApp, RenderDebugFlags, RenderSet,
     },
     tasks::AsyncComputeTaskPool,
-    utils::{HashMap, Parallel},
+    utils::Parallel,
 };
-use wgpu::{BufferUsages, ImageCopyBuffer, ImageDataLayout, ShaderStages};
+use wgpu::{BufferUsages, ShaderStages, TexelCopyBufferInfo, TexelCopyBufferLayout};
 
 use crate::{
     asset_loader::write_asset,
@@ -71,10 +79,13 @@ pub struct ImposterBakePlugin;
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderSubGraph)]
 pub struct ImposterBakeGraph;
 
-pub const STANDARD_BAKE_HANDLE: Handle<Shader> = Handle::weak_from_u128(72833264206534166);
-pub const IMPOSTER_BAKE_HANDLE: Handle<Shader> = Handle::weak_from_u128(28332642065341667);
-pub const SHARED_HANDLE: Handle<Shader> = Handle::weak_from_u128(699899997614446892);
-pub const IMPOSTER_BLIT_HANDLE: Handle<Shader> = Handle::weak_from_u128(269989999761444689);
+pub const STANDARD_BAKE_HANDLE: Handle<Shader> =
+    weak_handle!("ed669393-0761-4654-b575-d0cba4988181");
+pub const IMPOSTER_BAKE_HANDLE: Handle<Shader> =
+    weak_handle!("7e8a809d-d90b-4a8d-9a17-698cb3574c58");
+pub const SHARED_HANDLE: Handle<Shader> = weak_handle!("6f9a816c-9b58-4776-a51e-95fd96e9b29b");
+pub const IMPOSTER_BLIT_HANDLE: Handle<Shader> =
+    weak_handle!("c1727f8d-f6b7-4d56-b15d-605ecccf13fb");
 
 impl Plugin for ImposterBakePlugin {
     fn build(&self, app: &mut App) {
@@ -103,19 +114,19 @@ impl Plugin for ImposterBakePlugin {
         app.add_plugins(BinnedRenderPhasePlugin::<
             ImposterPhaseItem<Opaque3d>,
             MeshPipeline,
-        >::default());
+        >::new(RenderDebugFlags::all()));
         app.add_plugins(BinnedRenderPhasePlugin::<
             ImposterPhaseItem<AlphaMask3d>,
             MeshPipeline,
-        >::default());
+        >::new(RenderDebugFlags::empty()));
         app.add_plugins(SortedRenderPhasePlugin::<
             ImposterPhaseItem<Transparent3d>,
             MeshPipeline,
-        >::default());
+        >::new(RenderDebugFlags::empty()));
         app.add_systems(
             PostUpdate,
             (
-                check_imposter_visibility::<WithMesh>.in_set(VisibilitySystems::CheckVisibility),
+                check_imposter_visibility.in_set(VisibilitySystems::CheckVisibility),
                 check_finished_cameras,
             ),
         );
@@ -156,14 +167,25 @@ impl Plugin for ImposterBakePlugin {
                 ImposterBakeGraph,
                 ImposterBakeNode,
             )
-            .add_render_graph_node::<GpuPreprocessNode>(ImposterBakeGraph, NodePbr::GpuPreprocess)
+            .add_render_graph_node::<EarlyGpuPreprocessNode>(
+                ImposterBakeGraph,
+                NodePbr::EarlyGpuPreprocess,
+            )
+            .add_render_graph_node::<LateGpuPreprocessNode>(
+                ImposterBakeGraph,
+                NodePbr::LateGpuPreprocess,
+            )
             .add_render_graph_edges(
                 ImposterBakeGraph,
-                (NodePbr::GpuPreprocess, ImposterBakeNode),
+                (
+                    NodePbr::EarlyGpuPreprocess,
+                    NodePbr::LateGpuPreprocess,
+                    ImposterBakeNode,
+                ),
             );
 
         app.add_plugins(ImposterBakeMaterialPlugin::<StandardMaterial>::default());
-        app.add_plugins(ImposterBakeMaterialPlugin::<crate::Imposter>::default());
+        // app.add_plugins(ImposterBakeMaterialPlugin::<crate::Imposter>::default());
         // imposterception
     }
 
@@ -215,7 +237,7 @@ where
     fn build(&self, app: &mut App) {
         app.add_systems(
             PostUpdate,
-            count_expected_imposter_materials::<M>.after(check_imposter_visibility::<WithMesh>),
+            count_expected_imposter_materials::<M>.after(check_imposter_visibility),
         );
     }
 
@@ -408,6 +430,7 @@ pub struct ImposterBakeBundle {
     pub transform: Transform,
     pub global_transform: GlobalTransform,
     pub complete: ImposterBakeCompleteChannel,
+    pub _sync: SyncToRenderWorld,
 }
 
 impl Default for ImposterBakeBundle {
@@ -420,15 +443,16 @@ impl Default for ImposterBakeBundle {
             transform: Default::default(),
             global_transform: Default::default(),
             complete: Default::default(),
+            _sync: Default::default(),
         }
     }
 }
 
 #[derive(Resource, Default)]
-pub struct PartBaked(Arc<Mutex<HashMap<Entity, usize>>>);
+pub struct PartBaked(Arc<Mutex<HashMap<RetainedViewEntity, usize>>>);
 
 #[allow(clippy::type_complexity)]
-pub fn check_imposter_visibility<QF>(
+pub fn check_imposter_visibility(
     mut thread_queues: Local<Parallel<Vec<Entity>>>,
     mut view_query: Query<(
         Entity,
@@ -449,11 +473,11 @@ pub fn check_imposter_visibility<QF>(
             &GlobalTransform,
             Has<NoFrustumCulling>,
         ),
-        QF,
+        With<Mesh3d>,
     >,
-) where
-    QF: QueryFilter + 'static,
-{
+    frame: Res<FrameCount>,
+    mut previous_visible_entities: ResMut<PreviousVisibleEntities>,
+) {
     for (
         _view,
         gt,
@@ -464,7 +488,7 @@ pub fn check_imposter_visibility<QF>(
         no_cpu_culling,
     ) in &mut view_query
     {
-        visible_entities.clear::<QF>();
+        visible_entities.clear_all();
 
         if !camera.continuous && camera.state == BakeState::Finished {
             return;
@@ -484,6 +508,8 @@ pub fn check_imposter_visibility<QF>(
                     transform,
                     no_frustum_culling,
                 ) = query_item;
+
+                debug!("[{}] {entity} was {view_visibility:?}", frame.0);
 
                 // Skip computing visibility for entities that are configured to be hidden.
                 // ViewVisibility has already been reset in `reset_view_visibility`.
@@ -511,12 +537,19 @@ pub fn check_imposter_visibility<QF>(
                         }
                     }
                 }
-                view_visibility.set();
+                debug!("[{}] {entity} set", frame.0);
+
+                if !**view_visibility {
+                    view_visibility.set();
+                }
                 queue.push(entity);
             },
         );
 
-        thread_queues.drain_into(visible_entities.get_mut::<QF>());
+        thread_queues.drain_into(visible_entities.get_mut(TypeId::of::<Mesh3d>()));
+        for entity in visible_entities.get(TypeId::of::<Mesh3d>()) {
+            previous_visible_entities.remove(entity);
+        }
         expected_count.0 = 0;
     }
 }
@@ -524,11 +557,11 @@ pub fn check_imposter_visibility<QF>(
 #[allow(clippy::type_complexity)]
 fn count_expected_imposter_materials<M: ImposterBakeMaterial>(
     mut q: Query<(&mut ImposterExpectedRenderCount, &VisibleEntities), With<ImposterBakeCamera>>,
-    materials: Query<(), (With<Handle<M>>, With<Handle<Mesh>>)>,
+    materials: Query<(), (With<MeshMaterial3d<M>>, With<Mesh3d>)>,
 ) {
     for (mut count, visible_entities) in q.iter_mut() {
         let material_count = visible_entities
-            .iter::<WithMesh>()
+            .iter(TypeId::of::<Mesh3d>())
             .filter(|e| materials.get(**e).is_ok())
             .count();
         count.0 += material_count;
@@ -542,6 +575,7 @@ fn count_expected_imposter_materials<M: ImposterBakeMaterial>(
 
 #[derive(Component)]
 pub struct ExtractedImposterBakeCamera {
+    pub retained_view_entity: RetainedViewEntity,
     pub grid_size: u32,
     pub tile_size: u32,
     pub multisample: u32,
@@ -562,8 +596,14 @@ pub struct ImposterPhaseItem<T: 'static> {
 impl<T: SortedPhaseItem> SortedPhaseItem for ImposterPhaseItem<T> {
     type SortKey = T::SortKey;
 
+    #[inline]
     fn sort_key(&self) -> Self::SortKey {
         self.inner.sort_key()
+    }
+
+    #[inline]
+    fn indexed(&self) -> bool {
+        self.inner.indexed()
     }
 }
 
@@ -597,20 +637,33 @@ impl<T: PhaseItem> PhaseItem for ImposterPhaseItem<T> {
     fn batch_range_and_extra_index_mut(&mut self) -> (&mut Range<u32>, &mut PhaseItemExtraIndex) {
         self.inner.batch_range_and_extra_index_mut()
     }
+
+    #[inline]
+    fn main_entity(&self) -> bevy::render::sync_world::MainEntity {
+        self.inner.main_entity()
+    }
 }
 
 impl<T: BinnedPhaseItem> BinnedPhaseItem for ImposterPhaseItem<T> {
     type BinKey = T::BinKey;
+    type BatchSetKey = T::BatchSetKey;
 
     #[inline]
     fn new(
-        key: Self::BinKey,
-        representative_entity: Entity,
+        batch_key: Self::BatchSetKey,
+        bin_key: Self::BinKey,
+        representative_entity: (Entity, MainEntity),
         batch_range: Range<u32>,
         extra_index: PhaseItemExtraIndex,
     ) -> Self {
         Self {
-            inner: T::new(key, representative_entity, batch_range, extra_index),
+            inner: T::new(
+                batch_key,
+                bin_key,
+                representative_entity,
+                batch_range,
+                extra_index,
+            ),
         }
     }
 }
@@ -679,6 +732,7 @@ pub fn extract_imposter_cameras(
     cameras: Extract<
         Query<(
             Entity,
+            RenderEntity,
             &ImposterBakeCamera,
             &ImposterBakeCompleteChannel,
             &ImposterExpectedRenderCount,
@@ -686,20 +740,31 @@ pub fn extract_imposter_cameras(
             &VisibleEntities,
         )>,
     >,
+    mapper: Extract<Query<&RenderEntity>>,
 ) {
-    let mut entities = EntityHashSet::default();
+    let mut entities = HashSet::<RetainedViewEntity>::default();
 
-    for (entity, camera, channel, expected_count, gt, visible_entities) in cameras.iter() {
+    for (main_entity, render_entity, camera, channel, expected_count, gt, visible_entities) in
+        cameras.iter()
+    {
         if camera.state != BakeState::Rendering
             || !channel.receiver.as_ref().is_none_or(|r| r.is_empty())
         {
             continue;
         }
         debug!("extract");
-        opaque.insert_or_clear(entity);
-        alphamask.insert_or_clear(entity);
-        transparent.insert_or_clear(entity);
-        entities.insert(entity);
+
+        let retained_view_entity = RetainedViewEntity::new(main_entity.into(), None, 0);
+        opaque.prepare_for_new_frame(
+            retained_view_entity,
+            GpuPreprocessingMode::PreprocessingOnly,
+        );
+        alphamask.prepare_for_new_frame(
+            retained_view_entity,
+            GpuPreprocessingMode::PreprocessingOnly,
+        );
+        transparent.insert_or_clear(retained_view_entity);
+        entities.insert(retained_view_entity);
 
         let center = gt.translation();
         let mut subviews = Vec::default();
@@ -709,16 +774,39 @@ pub fn extract_imposter_cameras(
                 width: camera.radius * 2.0,
                 height: camera.radius * 2.0,
             },
-            ..Default::default()
+            ..OrthographicProjection::default_3d()
         };
         projection.update(0.0, 0.0);
+
+        let render_visible_entities = RenderVisibleEntities {
+            entities: visible_entities
+                .entities
+                .iter()
+                .map(|(type_id, entities)| {
+                    let entities = entities
+                        .iter()
+                        .map(|entity| {
+                            let render_entity = mapper
+                                .get(*entity)
+                                .cloned()
+                                .map(|entity| entity.id())
+                                .unwrap_or(Entity::PLACEHOLDER);
+                            (render_entity, (*entity).into())
+                        })
+                        .collect();
+                    (*type_id, entities)
+                })
+                .collect(),
+        };
+
         let clip_from_view = projection.get_clip_from_view();
         for y in 0..camera.grid_size {
             for x in 0..camera.grid_size {
+                let subview_index = y * camera.grid_size + x;
                 let camera_transform =
                     if let Some(camera_transforms) = camera.manual_camera_transforms.as_ref() {
                         *camera_transforms
-                            .get((y * camera.grid_size + x) as usize)
+                            .get(subview_index as usize)
                             .expect("not enough manual camera transforms")
                     } else {
                         let (normal, up) =
@@ -730,6 +818,10 @@ pub fn extract_imposter_cameras(
                     };
 
                 let view = ExtractedView {
+                    retained_view_entity: RetainedViewEntity {
+                        subview_index,
+                        ..retained_view_entity
+                    },
                     clip_from_view,
                     world_from_view: camera_transform,
                     clip_from_world: None,
@@ -743,14 +835,15 @@ pub fn extract_imposter_cameras(
                     color_grading: ColorGrading::default(),
                 };
 
-                let id = commands.spawn(view).id();
+                let id = commands.spawn((view, NoIndirectDrawing)).id();
 
                 subviews.push((x, y, id));
             }
         }
 
-        commands.get_or_spawn(entity).insert((
+        commands.entity(render_entity).insert((
             ExtractedImposterBakeCamera {
+                retained_view_entity,
                 grid_size: camera.grid_size,
                 tile_size: camera.tile_size,
                 target: camera.target.clone(),
@@ -776,10 +869,20 @@ pub fn extract_imposter_cameras(
                 exposure: 0.0,
                 hdr: false,
             },
-            visible_entities.clone(),
+            render_visible_entities,
             // we must add this to get the gpu mesh uniform system to pick up the view and generate mesh uniforms for us
             // value doesn't matter as we won't render using this view
+            ExtractedView {
+                retained_view_entity,
+                clip_from_view,
+                world_from_view: GlobalTransform::IDENTITY,
+                clip_from_world: None,
+                hdr: false,
+                viewport: UVec4::new(0, 0, 1, 1),
+                color_grading: ColorGrading::default(),
+            },
             ViewUniformOffset { offset: u32::MAX },
+            NoIndirectDrawing,
         ));
     }
 
@@ -795,7 +898,7 @@ pub fn extract_imposter_cameras(
 
 fn copy_preprocess_bindgroups(
     mut commands: Commands,
-    source: Query<(&ExtractedImposterBakeCamera, &PreprocessBindGroup)>,
+    source: Query<(&ExtractedImposterBakeCamera, &PreprocessBindGroups)>,
 ) {
     for (views, bindgroup) in source.iter() {
         for (_, _, view) in views.subviews.iter() {
@@ -842,9 +945,9 @@ where
         // pretty similar to a prepass, so let's start there.
         // would be glorious if this was abstracted so we could avoid cheating like this, or copy/pasting 250 lines
 
-        // add DEPTH_CLAMP_ORTHO to force fragment shader
+        // add MAY_DISCARD to force fragment shader
         let key = MaterialPipelineKey {
-            mesh_key: key.mesh_key.union(MeshPipelineKey::DEPTH_CLAMP_ORTHO),
+            mesh_key: key.mesh_key.union(MeshPipelineKey::MAY_DISCARD),
             bind_group_data: key.bind_group_data,
         };
 
@@ -864,14 +967,15 @@ where
         defs.extend([
             "IMPOSTER_BAKE_PIPELINE".into(),
             "PREPASS_FRAGMENT".into(),
-            "DEPTH_CLAMP_ORTHO".into(),
             "DEFERRED_PREPASS".into(),
             "NORMAL_PREPASS_OR_DEFERRED_PREPASS".into(),
             "VIEW_PROJECTION_ORTHOGRAPHIC".into(),
+            "VERTEX_OUTPUT_INSTANCE_INDEX".into(),
         ]);
 
         // force inclusion of the vertex normals/tangents
         let mut vertex_attributes = vec![Mesh::ATTRIBUTE_NORMAL.at_shader_location(3)];
+        defs.push("VERTEX_NORMALS".into());
         if layout.0.contains(Mesh::ATTRIBUTE_TANGENT) {
             defs.push("VERTEX_TANGENTS".into());
             vertex_attributes.push(Mesh::ATTRIBUTE_TANGENT.at_shader_location(4));
@@ -896,11 +1000,15 @@ where
         frag_defs.extend([
             "IMPOSTER_BAKE_PIPELINE".into(),
             "PREPASS_FRAGMENT".into(),
-            "DEPTH_CLAMP_ORTHO".into(),
             "DEFERRED_PREPASS".into(),
             "NORMAL_PREPASS_OR_DEFERRED_PREPASS".into(),
             "VIEW_PROJECTION_ORTHOGRAPHIC".into(),
+            "VERTEX_OUTPUT_INSTANCE_INDEX".into(),
+            "VERTEX_NORMALS".into(),
         ]);
+        if layout.0.contains(Mesh::ATTRIBUTE_TANGENT) {
+            defs.push("VERTEX_TANGENTS".into());
+        }
 
         // replace frag state
         descriptor.fragment = Some(FragmentState {
@@ -966,6 +1074,7 @@ impl FromWorld for ImposterBlitPipeline {
             push_constant_ranges: Default::default(),
             primitive: Default::default(),
             multisample: Default::default(),
+            zero_initialize_workgroup_memory: false,
         });
 
         Self { layout, pipeline }
@@ -994,7 +1103,7 @@ pub fn prepare_imposter_textures(
     queue: Res<RenderQueue>,
 ) {
     for (entity, camera) in views.iter() {
-        if !opaque_phases.contains_key(&entity) {
+        if !opaque_phases.contains_key(&camera.retained_view_entity) {
             continue;
         }
 
@@ -1113,18 +1222,22 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
     opaque_draw_functions: Res<DrawFunctions<ImposterPhaseItem<Opaque3d>>>,
     alphamask_draw_functions: Res<DrawFunctions<ImposterPhaseItem<AlphaMask3d>>>,
     transparent_draw_functions: Res<DrawFunctions<ImposterPhaseItem<Transparent3d>>>,
-    mut views: Query<(Entity, &VisibleEntities), With<ExtractedImposterBakeCamera>>,
+    mut views: Query<(&ExtractedImposterBakeCamera, &RenderVisibleEntities)>,
     mut opaque_render_phases: ResMut<ViewBinnedRenderPhases<ImposterPhaseItem<Opaque3d>>>,
     mut alphamask_render_phases: ResMut<ViewBinnedRenderPhases<ImposterPhaseItem<AlphaMask3d>>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<ImposterPhaseItem<Transparent3d>>>,
     imposter_pipeline: Res<ImposterBakePipeline<M>>,
     mut pipelines: ResMut<SpecializedMeshPipelines<ImposterBakePipeline<M>>>,
     pipeline_cache: Res<PipelineCache>,
-    render_meshes: Res<RenderAssets<GpuMesh>>,
+    render_meshes: Res<RenderAssets<RenderMesh>>,
     render_mesh_instances: Res<RenderMeshInstances>,
     render_materials: Res<RenderAssets<PreparedMaterial<M>>>,
-    render_material_instances: Res<RenderMaterialInstances<M>>,
-    // render_lightmaps: Res<RenderLightmaps>,
+    render_material_instances: Res<RenderMaterialInstances>,
+    mesh_allocator: Res<MeshAllocator>,
+    (gpu_preprocessing_support, material_bind_group_allocator): (
+        Res<GpuPreprocessingSupport>,
+        Res<MaterialBindGroupAllocator<M>>,
+    ),
 ) where
     M::Data: PartialEq + Eq + Hash + Clone,
 {
@@ -1141,31 +1254,53 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
         .get_id::<DrawImposter<M>>()
         .unwrap();
 
-    for (view, visible_entities) in &mut views {
+    for (camera, visible_entities) in &mut views {
+        debug!("check view");
         let (Some(opaque_phase), Some(alphamask_phase), Some(transparent_phase)) = (
-            opaque_render_phases.get_mut(&view),
-            alphamask_render_phases.get_mut(&view),
-            transparent_render_phases.get_mut(&view),
+            opaque_render_phases.get_mut(&camera.retained_view_entity),
+            alphamask_render_phases.get_mut(&camera.retained_view_entity),
+            transparent_render_phases.get_mut(&camera.retained_view_entity),
         ) else {
+            debug!("skip phase");
             continue;
         };
 
         let view_key = MeshPipelineKey::from_msaa_samples(1);
 
-        for visible_entity in visible_entities.iter::<WithMesh>() {
-            let Some(material_asset_id) = render_material_instances.get(visible_entity) else {
+        for (render_entity, visible_entity) in visible_entities.iter::<Mesh3d>() {
+            let Some(material_instance) = render_material_instances.instances.get(visible_entity)
+            else {
+                debug!("skip material instance");
                 continue;
             };
             let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*visible_entity)
             else {
-                continue;
-            };
-            let Some(material) = render_materials.get(*material_asset_id) else {
+                debug!("skip mesh instance");
                 continue;
             };
             let Some(mesh) = render_meshes.get(mesh_instance.mesh_asset_id) else {
+                debug!("skip mesh");
                 continue;
             };
+            let Ok(material_asset_id) = material_instance.asset_id.try_typed::<M>() else {
+                debug!(
+                    "skip material asset id - {:?}",
+                    material_instance.asset_id.try_typed::<M>()
+                );
+                continue;
+            };
+            let Some(material) = render_materials.get(material_asset_id) else {
+                debug!("skip material");
+                continue;
+            };
+            let Some(material_bind_group) =
+                material_bind_group_allocator.get(material.binding.group)
+            else {
+                debug!("skip material bindgroup");
+                continue;
+            };
+
+            debug!("don't skip");
 
             let mut mesh_key = view_key | MeshPipelineKey::from_bits_retain(mesh.key_bits.bits());
 
@@ -1190,7 +1325,9 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
                 &imposter_pipeline,
                 MaterialPipelineKey {
                     mesh_key,
-                    bind_group_data: material.key.clone(),
+                    bind_group_data: material_bind_group
+                        .get_extra_data(material.binding.slot)
+                        .clone(),
                 },
                 &mesh.layout,
             );
@@ -1202,46 +1339,66 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
                 }
             };
 
+            let (vertex_slab, index_slab) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id);
+
             match mesh_key
                 .intersection(MeshPipelineKey::BLEND_RESERVED_BITS | MeshPipelineKey::MAY_DISCARD)
             {
                 MeshPipelineKey::BLEND_OPAQUE | MeshPipelineKey::BLEND_ALPHA_TO_COVERAGE => {
+                    let batch_set_key = Opaque3dBatchSetKey {
+                        pipeline: pipeline_id,
+                        draw_function: opaque_draw,
+                        material_bind_group_index: Some(material.binding.group.0),
+                        vertex_slab: vertex_slab.unwrap_or_default(),
+                        index_slab,
+                        lightmap_slab: None,
+                    };
+                    let bin_key = Opaque3dBinKey {
+                        asset_id: mesh_instance.mesh_asset_id.into(),
+                    };
+
                     opaque_phase.add(
-                        Opaque3dBinKey {
-                            draw_function: opaque_draw,
-                            pipeline: pipeline_id,
-                            asset_id: mesh_instance.mesh_asset_id.into(),
-                            material_bind_group_id: material.get_bind_group_id().0,
-                            lightmap_image: None, // can't check the mesh bit
-                        },
-                        *visible_entity,
-                        BinnedRenderPhaseType::mesh(mesh_instance.should_batch()),
+                        batch_set_key,
+                        bin_key,
+                        (*render_entity, *visible_entity),
+                        mesh_instance.current_uniform_index,
+                        BinnedRenderPhaseType::mesh(false, &gpu_preprocessing_support),
+                        material_instance.last_change_tick,
                     );
                 }
                 // Alpha mask
                 MeshPipelineKey::MAY_DISCARD => {
+                    let batch_set_key = OpaqueNoLightmap3dBatchSetKey {
+                        draw_function: alphamask_draw,
+                        pipeline: pipeline_id,
+                        material_bind_group_index: Some(material.binding.group.0),
+                        vertex_slab: vertex_slab.unwrap_or_default(),
+                        index_slab,
+                    };
+                    let bin_key = OpaqueNoLightmap3dBinKey {
+                        asset_id: mesh_instance.mesh_asset_id.into(),
+                    };
                     alphamask_phase.add(
-                        OpaqueNoLightmap3dBinKey {
-                            draw_function: alphamask_draw,
-                            pipeline: pipeline_id,
-                            asset_id: mesh_instance.mesh_asset_id.into(),
-                            material_bind_group_id: material.get_bind_group_id().0,
-                        },
-                        *visible_entity,
-                        BinnedRenderPhaseType::mesh(mesh_instance.should_batch()),
+                        batch_set_key,
+                        bin_key,
+                        (*render_entity, *visible_entity),
+                        mesh_instance.current_uniform_index,
+                        BinnedRenderPhaseType::mesh(false, &gpu_preprocessing_support),
+                        material_instance.last_change_tick,
                     );
                 }
                 _ => {
                     transparent_phase.add(ImposterPhaseItem {
                         inner: Transparent3d {
-                            entity: *visible_entity,
+                            entity: (*render_entity, *visible_entity),
                             draw_function: transparent_draw,
                             pipeline: pipeline_id,
                             // since we share the mesh bindgroup this will be wrong for some views whatever we use.
                             // todo: use oit?
                             distance: 0.0,
                             batch_range: 0..1,
-                            extra_index: PhaseItemExtraIndex::NONE,
+                            extra_index: PhaseItemExtraIndex::None,
+                            indexed: index_slab.is_some(),
                         },
                     });
                 }
@@ -1261,23 +1418,25 @@ impl ViewNode for ImposterBakeNode {
 
     fn run<'w>(
         &self,
-        graph: &mut bevy::render::render_graph::RenderGraphContext,
+        _graph: &mut bevy::render::render_graph::RenderGraphContext,
         render_context: &mut bevy::render::renderer::RenderContext<'w>,
         (camera, textures): bevy::ecs::query::QueryItem<'w, Self::ViewQuery>,
         world: &'w World,
     ) -> Result<(), bevy::render::render_graph::NodeRunError> {
-        let view = graph.view_entity();
+        // let view = graph.view_entity();
+
+        debug!("running node");
 
         let (Some(opaque_phase), Some(alphamask_phase), Some(transparent_phase)) = (
             world
                 .get_resource::<ViewBinnedRenderPhases<ImposterPhaseItem<Opaque3d>>>()
-                .and_then(|phases| phases.get(&view)),
+                .and_then(|phases| phases.get(&camera.retained_view_entity)),
             world
                 .get_resource::<ViewBinnedRenderPhases<ImposterPhaseItem<AlphaMask3d>>>()
-                .and_then(|phases| phases.get(&view)),
+                .and_then(|phases| phases.get(&camera.retained_view_entity)),
             world
                 .get_resource::<ViewSortedRenderPhases<ImposterPhaseItem<Transparent3d>>>()
-                .and_then(|phases| phases.get(&view)),
+                .and_then(|phases| phases.get(&camera.retained_view_entity)),
         ) else {
             return Ok(());
         };
@@ -1305,7 +1464,10 @@ impl ViewNode for ImposterBakeNode {
                     label: Some("imposter_command_encoder"),
                 });
 
-            let mut rendered = part_baked.get(&view).copied().unwrap_or_default();
+            let mut rendered = part_baked
+                .get(&camera.retained_view_entity)
+                .copied()
+                .unwrap_or_default();
 
             if camera.multisample == 1 {
                 if rendered > 0 {
@@ -1339,9 +1501,10 @@ impl ViewNode for ImposterBakeNode {
                     // we use the batch from the dummy main view, which means items will be rendered potentially out of order
                     // TODO: see if it's worth binning for every individual view separately. since this is baking, probably not for opaque.
                     // if we use it for dynamic imposters in future there'd only be a single view being rendered anyway
-                    opaque_phase.render(&mut render_pass, world, camera.subviews[0].2);
-                    alphamask_phase.render(&mut render_pass, world, camera.subviews[0].2);
-                    transparent_phase.render(&mut render_pass, world, camera.subviews[0].2);
+                    let r = opaque_phase.render(&mut render_pass, world, camera.subviews[0].2);
+                    debug!("r1: {r:?}");
+                    let _ = alphamask_phase.render(&mut render_pass, world, camera.subviews[0].2);
+                    let _ = transparent_phase.render(&mut render_pass, world, camera.subviews[0].2);
 
                     let actual = *actual.0.lock().unwrap();
 
@@ -1367,9 +1530,10 @@ impl ViewNode for ImposterBakeNode {
                             0.0,
                             1.0,
                         );
-                        opaque_phase.render(&mut render_pass, world, *view);
-                        alphamask_phase.render(&mut render_pass, world, *view);
-                        transparent_phase.render(&mut render_pass, world, *view);
+                        let r = opaque_phase.render(&mut render_pass, world, *view);
+                        debug!("r2: {r:?}");
+                        let _ = alphamask_phase.render(&mut render_pass, world, *view);
+                        let _ = transparent_phase.render(&mut render_pass, world, *view);
                         rendered += 1;
                     }
                 }
@@ -1400,9 +1564,10 @@ impl ViewNode for ImposterBakeNode {
                         occlusion_query_set: None,
                     });
                     let mut render_pass = TrackedRenderPass::new(&render_device, render_pass);
-                    opaque_phase.render(&mut render_pass, world, *view);
-                    alphamask_phase.render(&mut render_pass, world, *view);
-                    transparent_phase.render(&mut render_pass, world, *view);
+                    let r = opaque_phase.render(&mut render_pass, world, *view);
+                    debug!("r3: {r:?}");
+                    let _ = alphamask_phase.render(&mut render_pass, world, *view);
+                    let _ = transparent_phase.render(&mut render_pass, world, *view);
 
                     if rendered == 0 {
                         let actual = *actual.0.lock().unwrap();
@@ -1447,15 +1612,15 @@ impl ViewNode for ImposterBakeNode {
                 }
             }
 
-            part_baked.insert(view, rendered);
+            part_baked.insert(camera.retained_view_entity, rendered);
             debug!(
                 "{:?} -> {}/{}",
-                view,
+                camera.retained_view_entity,
                 rendered,
                 camera.grid_size * camera.grid_size
             );
             if rendered as u32 == camera.grid_size * camera.grid_size {
-                part_baked.remove(&view);
+                part_baked.remove(&camera.retained_view_entity);
                 if let Some(callback) = camera.callback.as_ref() {
                     debug!("send callback buffer");
                     let render_device = world.resource::<RenderDevice>();
@@ -1473,9 +1638,9 @@ impl ViewNode for ImposterBakeNode {
 
                     command_encoder.copy_texture_to_buffer(
                         textures.output.texture.texture.as_image_copy(),
-                        ImageCopyBuffer {
+                        TexelCopyBufferInfo {
                             buffer: &buffer,
-                            layout: ImageDataLayout {
+                            layout: TexelCopyBufferLayout {
                                 bytes_per_row: Some(get_aligned_size(
                                     camera.tile_size * camera.grid_size,
                                     1,

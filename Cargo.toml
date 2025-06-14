@@ -5,14 +5,18 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# bevy = { git = "https://github.com/robtfm/bevy", branch = "0.14.2-plus-16188" }
-bevy = "0.14"
-# bevy = { git = "https://github.com/robtfm/bevy", branch = "release-0.14-dcl-cosmic-noimage" }
-wgpu = "0.20"
-crossbeam-channel = "0.5.13"
-async-channel = "2.2.0"
-image = "0.25.2"
-bytemuck = "1.7"
+bevy = { path = "../bevy", default-features=false, features = [
+    "bevy_core_pipeline",
+    "bevy_render", 
+    "bevy_pbr",
+    "bevy_log",
+    "bevy_asset"
+] }
+wgpu = "24"
+crossbeam-channel = "*"
+async-channel = "*"
+image = "*"
+bytemuck = "*"
 
 # asset loader
 zip = { version = "2", default-features = false }
@@ -20,8 +24,7 @@ anyhow = "*"
 serde = { version = "1", features = ["derive"] }
 
 # examples
+[dev-dependencies]
 pico-args = "0.5.0"
 rand = "0.8.5"
-
-[patch.crates-io]
-bevy = { git = "https://github.com/robtfm/bevy", branch = "0.14.2-plus-16188" }
+bevy = { path = "../bevy", default-features = true }

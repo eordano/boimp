@@ -1,13 +1,13 @@
 use core::str;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{Cursor, Read, Write},
+    io::{BufReader, Cursor, Read, Write},
     path::PathBuf,
 };
 
 use anyhow::anyhow;
 use bevy::{
-    asset::{AssetLoader, AsyncReadExt},
+    asset::AssetLoader,
     log::{debug, info},
     math::{UVec2, Vec3},
     prelude::{AlphaMode, Image},
@@ -54,12 +54,12 @@ impl AssetLoader for ImposterLoader {
 
     type Error = anyhow::Error;
 
-    fn load<'a>(
-        &'a self,
-        reader: &'a mut bevy::asset::io::Reader,
-        load_settings: &'a Self::Settings,
-        load_context: &'a mut bevy::asset::LoadContext,
-    ) -> impl bevy::utils::ConditionalSendFuture<Output = Result<Self::Asset, Self::Error>> {
+    fn load(
+        &self,
+        reader: &mut dyn bevy::asset::io::Reader,
+        load_settings: &Self::Settings,
+        load_context: &mut bevy::asset::LoadContext,
+    ) -> impl bevy::tasks::ConditionalSendFuture<Output = Result<Self::Asset, Self::Error>> {
         Box::pin(async move {
             let mut bytes = Vec::new();
             reader
@@ -68,8 +68,7 @@ impl AssetLoader for ImposterLoader {
                 .map_err(|_| anyhow!("read failed"))?;
             let cursor = Cursor::new(&bytes[..]);
             let mut zip = zip::ZipArchive::new(cursor)?;
-            let settings = zip
-                .by_name("settings.txt")?
+            let settings = BufReader::new(zip.by_name("settings.txt")?)
                 .bytes()
                 .collect::<Result<Vec<_>, _>>()?;
             let mut parts = str::from_utf8(&settings)?.split(' ');
@@ -103,8 +102,7 @@ impl AssetLoader for ImposterLoader {
 
             let is_indexed = zip.file_names().any(|n| n == "pixels.png");
             let (pixels_image, indices_image, vram_bytes) = if is_indexed {
-                let raw_pixels = zip
-                    .by_name("pixels.png")?
+                let raw_pixels = BufReader::new(zip.by_name("pixels.png")?)
                     .bytes()
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut reader = image::ImageReader::new(std::io::Cursor::new(raw_pixels));
@@ -127,8 +125,7 @@ impl AssetLoader for ImposterLoader {
                 let pixels_image =
                     load_context.add_labeled_asset("pixels".to_owned(), pixels_image);
 
-                let raw_indices = zip
-                    .by_name("indices.png")?
+                let raw_indices = BufReader::new(zip.by_name("indices.png")?)
                     .bytes()
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut reader = image::ImageReader::new(std::io::Cursor::new(raw_indices));
@@ -139,7 +136,7 @@ impl AssetLoader for ImposterLoader {
                 let use_u16 = pixels_x * pixels_y < 65536;
 
                 let size: UVec2 = packed_tile_size * grid_size;
-                let width = if use_u16 { (size.x + 1) / 2 } else { size.x };
+                let width = if use_u16 { size.x.div_ceil(2) } else { size.x };
                 debug!(
                     "load use_u16? {use_u16}, base size: {}, use size: {}, height: {}, total pix: {}",
                     size.x,
@@ -166,8 +163,7 @@ impl AssetLoader for ImposterLoader {
                     pixels_x * pixels_y * 8 + width * size.y * 4,
                 )
             } else {
-                let raw_image = zip
-                    .by_name("texture.png")?
+                let raw_image = BufReader::new(zip.by_name("texture.png")?)
                     .bytes()
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut reader = image::ImageReader::new(std::io::Cursor::new(raw_image));
@@ -254,14 +250,10 @@ impl AssetLoader for ImposterLoader {
 pub fn pack_asset(grid_size: usize, image: &Image) -> (Image, UVec2, UVec2) {
     let width = image.width() as usize;
     let pixels_per_tile = width / grid_size;
-    let mut used_x = std::iter::repeat(false)
-        .take(pixels_per_tile)
-        .collect::<Vec<_>>();
-    let mut used_y = std::iter::repeat(false)
-        .take(pixels_per_tile)
-        .collect::<Vec<_>>();
+    let mut used_x = std::iter::repeat_n(false, pixels_per_tile).collect::<Vec<_>>();
+    let mut used_y = std::iter::repeat_n(false, pixels_per_tile).collect::<Vec<_>>();
 
-    let data: &[u32] = bytemuck::cast_slice(&image.data);
+    let data: &[u32] = bytemuck::cast_slice(image.data.as_ref().unwrap());
 
     for grid_x in 0..grid_size {
         for grid_y in 0..grid_size {
@@ -315,8 +307,10 @@ pub fn pack_asset(grid_size: usize, image: &Image) -> (Image, UVec2, UVec2) {
         std::process::exit(1);
     }
 
-    let mut new_data =
-        Vec::from_iter(std::iter::repeat(0u32).take(x_count * y_count * 2 * grid_size * grid_size));
+    let mut new_data = Vec::from_iter(std::iter::repeat_n(
+        0u32,
+        x_count * y_count * 2 * grid_size * grid_size,
+    ));
     for grid_y in 0..grid_size {
         for grid_x in 0..grid_size {
             for pix_y in 0..y_count {
@@ -386,7 +380,7 @@ pub fn write_asset(
     if index {
         // gather unique pixel pairs
         let mut pixels = BTreeSet::<[u8; 8]>::default();
-        for chunk in image.data.chunks_exact(8) {
+        for chunk in image.data.as_ref().unwrap().chunks_exact(8) {
             pixels.insert(chunk.try_into().unwrap());
         }
 
@@ -406,10 +400,10 @@ pub fn write_asset(
             // write unique pixels to an image
             let mut pixel_data = pixels.iter().copied().flatten().collect::<Vec<_>>();
             // pad to square
-            pixel_data.extend(
-                std::iter::repeat(0u8)
-                    .take(((pixels_x * pixels_y * 8) as usize).saturating_sub(pixel_data.len())),
-            );
+            pixel_data.extend(std::iter::repeat_n(
+                0u8,
+                ((pixels_x * pixels_y * 8) as usize).saturating_sub(pixel_data.len()),
+            ));
             let pixels_image = Image::new(
                 Extent3d {
                     width: pixels_x,
@@ -427,7 +421,7 @@ pub fn write_asset(
                 ImageBuffer::from_raw(
                     pixels_image.width() * 2,
                     pixels_image.height(),
-                    pixels_image.data,
+                    pixels_image.data.unwrap(),
                 )
                 .unwrap(),
             );
@@ -453,6 +447,8 @@ pub fn write_asset(
                 .collect::<BTreeMap<_, _>>();
             let mut pixel_indices = image
                 .data
+                .as_ref()
+                .unwrap()
                 .chunks_exact(8)
                 .flat_map(|chunk| {
                     let chunk: [u8; 8] = chunk.try_into().unwrap();
@@ -502,7 +498,7 @@ pub fn write_asset(
                 ImageBuffer::from_raw(
                     indices_image.width(),
                     indices_image.height(),
-                    indices_image.data,
+                    indices_image.data.unwrap(),
                 )
                 .unwrap(),
             );
@@ -518,7 +514,7 @@ pub fn write_asset(
     if !wrote_indexed {
         // write image directly
         let dyn_image = DynamicImage::ImageRgba8(
-            ImageBuffer::from_raw(image.width() * 2, image.height(), image.data).unwrap(),
+            ImageBuffer::from_raw(image.width() * 2, image.height(), image.data.unwrap()).unwrap(),
         );
         let mut cursor = Cursor::new(Vec::default());
         dyn_image
