@@ -15,7 +15,6 @@ use bevy::{
         fullscreen_vertex_shader::fullscreen_shader_vertex_state,
         prepass::{OpaqueNoLightmap3dBatchSetKey, OpaqueNoLightmap3dBinKey},
     },
-    diagnostic::FrameCount,
     ecs::system::lifetimeless::SRes,
     image::{ImageSampler, TextureFormatPixelInfo},
     pbr::{
@@ -475,7 +474,6 @@ pub fn check_imposter_visibility(
         ),
         With<Mesh3d>,
     >,
-    frame: Res<FrameCount>,
     mut previous_visible_entities: ResMut<PreviousVisibleEntities>,
 ) {
     for (
@@ -509,8 +507,6 @@ pub fn check_imposter_visibility(
                     no_frustum_culling,
                 ) = query_item;
 
-                debug!("[{}] {entity} was {view_visibility:?}", frame.0);
-
                 // Skip computing visibility for entities that are configured to be hidden.
                 // ViewVisibility has already been reset in `reset_view_visibility`.
                 if !inherited_visibility.get() {
@@ -537,8 +533,6 @@ pub fn check_imposter_visibility(
                         }
                     }
                 }
-                debug!("[{}] {entity} set", frame.0);
-
                 if !**view_visibility {
                     view_visibility.set();
                 }
@@ -752,8 +746,6 @@ pub fn extract_imposter_cameras(
         {
             continue;
         }
-        debug!("extract");
-
         let retained_view_entity = RetainedViewEntity::new(main_entity.into(), None, 0);
         opaque.prepare_for_new_frame(
             retained_view_entity,
@@ -1255,13 +1247,11 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
         .unwrap();
 
     for (camera, visible_entities) in &mut views {
-        debug!("check view");
         let (Some(opaque_phase), Some(alphamask_phase), Some(transparent_phase)) = (
             opaque_render_phases.get_mut(&camera.retained_view_entity),
             alphamask_render_phases.get_mut(&camera.retained_view_entity),
             transparent_render_phases.get_mut(&camera.retained_view_entity),
         ) else {
-            debug!("skip phase");
             continue;
         };
 
@@ -1270,37 +1260,26 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
         for (render_entity, visible_entity) in visible_entities.iter::<Mesh3d>() {
             let Some(material_instance) = render_material_instances.instances.get(visible_entity)
             else {
-                debug!("skip material instance");
                 continue;
             };
             let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*visible_entity)
             else {
-                debug!("skip mesh instance");
                 continue;
             };
             let Some(mesh) = render_meshes.get(mesh_instance.mesh_asset_id) else {
-                debug!("skip mesh");
                 continue;
             };
             let Ok(material_asset_id) = material_instance.asset_id.try_typed::<M>() else {
-                debug!(
-                    "skip material asset id - {:?}",
-                    material_instance.asset_id.try_typed::<M>()
-                );
                 continue;
             };
             let Some(material) = render_materials.get(material_asset_id) else {
-                debug!("skip material");
                 continue;
             };
             let Some(material_bind_group) =
                 material_bind_group_allocator.get(material.binding.group)
             else {
-                debug!("skip material bindgroup");
                 continue;
             };
-
-            debug!("don't skip");
 
             let mut mesh_key = view_key | MeshPipelineKey::from_bits_retain(mesh.key_bits.bits());
 
@@ -1423,10 +1402,6 @@ impl ViewNode for ImposterBakeNode {
         (camera, textures): bevy::ecs::query::QueryItem<'w, Self::ViewQuery>,
         world: &'w World,
     ) -> Result<(), bevy::render::render_graph::NodeRunError> {
-        // let view = graph.view_entity();
-
-        debug!("running node");
-
         let (Some(opaque_phase), Some(alphamask_phase), Some(transparent_phase)) = (
             world
                 .get_resource::<ViewBinnedRenderPhases<ImposterPhaseItem<Opaque3d>>>()
@@ -1501,8 +1476,7 @@ impl ViewNode for ImposterBakeNode {
                     // we use the batch from the dummy main view, which means items will be rendered potentially out of order
                     // TODO: see if it's worth binning for every individual view separately. since this is baking, probably not for opaque.
                     // if we use it for dynamic imposters in future there'd only be a single view being rendered anyway
-                    let r = opaque_phase.render(&mut render_pass, world, camera.subviews[0].2);
-                    debug!("r1: {r:?}");
+                    let _ = opaque_phase.render(&mut render_pass, world, camera.subviews[0].2);
                     let _ = alphamask_phase.render(&mut render_pass, world, camera.subviews[0].2);
                     let _ = transparent_phase.render(&mut render_pass, world, camera.subviews[0].2);
 
@@ -1530,8 +1504,7 @@ impl ViewNode for ImposterBakeNode {
                             0.0,
                             1.0,
                         );
-                        let r = opaque_phase.render(&mut render_pass, world, *view);
-                        debug!("r2: {r:?}");
+                        let _ = opaque_phase.render(&mut render_pass, world, *view);
                         let _ = alphamask_phase.render(&mut render_pass, world, *view);
                         let _ = transparent_phase.render(&mut render_pass, world, *view);
                         rendered += 1;
@@ -1564,8 +1537,7 @@ impl ViewNode for ImposterBakeNode {
                         occlusion_query_set: None,
                     });
                     let mut render_pass = TrackedRenderPass::new(&render_device, render_pass);
-                    let r = opaque_phase.render(&mut render_pass, world, *view);
-                    debug!("r3: {r:?}");
+                    let _ = opaque_phase.render(&mut render_pass, world, *view);
                     let _ = alphamask_phase.render(&mut render_pass, world, *view);
                     let _ = transparent_phase.render(&mut render_pass, world, *view);
 
