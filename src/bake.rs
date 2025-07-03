@@ -184,7 +184,7 @@ impl Plugin for ImposterBakePlugin {
             );
 
         app.add_plugins(ImposterBakeMaterialPlugin::<StandardMaterial>::default());
-        // app.add_plugins(ImposterBakeMaterialPlugin::<crate::Imposter>::default());
+        app.add_plugins(ImposterBakeMaterialPlugin::<crate::Imposter>::default());
         // imposterception
     }
 
