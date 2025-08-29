@@ -34,6 +34,7 @@ pub struct ImposterLoaderSettings {
     // if you need more control you can modify the loaded asset (we can't put actual alpha mode here because it doesn't serialize)
     pub alpha_blend: f32,
     pub multisample_amount: f32,
+    immediate_upload: bool,
 }
 
 impl Default for ImposterLoaderSettings {
@@ -43,6 +44,7 @@ impl Default for ImposterLoaderSettings {
             alpha: 1.0,
             alpha_blend: 0.0,
             multisample_amount: 0.99,
+            immediate_upload: false,
         }
     }
 }
@@ -111,7 +113,7 @@ impl AssetLoader for ImposterLoader {
                 let pixels_bytes = reader.decode()?.into_bytes();
                 let pixels_x = (pixels_bytes.len() as f32 / 8.0).sqrt().ceil() as u32;
                 let pixels_y = (pixels_bytes.len() as f32 / (8 * pixels_x) as f32).ceil() as u32;
-                let pixels_image = Image::new(
+                let mut pixels_image = Image::new(
                     Extent3d {
                         width: pixels_x,
                         height: pixels_y,
@@ -122,6 +124,7 @@ impl AssetLoader for ImposterLoader {
                     TextureFormat::Rg32Uint,
                     RenderAssetUsages::RENDER_WORLD,
                 );
+                pixels_image.immediate_upload = load_settings.immediate_upload;
                 let pixels_image =
                     load_context.add_labeled_asset("pixels".to_owned(), pixels_image);
 
@@ -144,7 +147,7 @@ impl AssetLoader for ImposterLoader {
                     size.y,
                     indices_bytes.len()
                 );
-                let indices_image = Image::new(
+                let mut indices_image = Image::new(
                     Extent3d {
                         width,
                         height: size.y,
@@ -155,6 +158,7 @@ impl AssetLoader for ImposterLoader {
                     TextureFormat::R32Uint,
                     RenderAssetUsages::RENDER_WORLD,
                 );
+                indices_image.immediate_upload = load_settings.immediate_upload;
                 let indices_image =
                     load_context.add_labeled_asset("indices".to_owned(), indices_image);
                 (
@@ -171,7 +175,7 @@ impl AssetLoader for ImposterLoader {
                 reader.no_limits();
                 let pixels_bytes = reader.decode()?.into_bytes();
                 let size: UVec2 = packed_tile_size * grid_size;
-                let pixels_image = Image::new(
+                let mut pixels_image = Image::new(
                     Extent3d {
                         width: size.x,
                         height: size.y,
@@ -182,23 +186,24 @@ impl AssetLoader for ImposterLoader {
                     TextureFormat::Rg32Uint,
                     RenderAssetUsages::RENDER_WORLD,
                 );
+                pixels_image.immediate_upload = load_settings.immediate_upload;
                 let pixels_image =
                     load_context.add_labeled_asset("texture".to_owned(), pixels_image);
 
-                let indices_image = load_context.add_labeled_asset(
-                    "dummy_indices".to_owned(),
-                    Image::new(
-                        Extent3d {
-                            width: 1,
-                            height: 1,
-                            depth_or_array_layers: 1,
-                        },
-                        wgpu::TextureDimension::D2,
-                        vec![0, 0, 0, 0],
-                        TextureFormat::R32Uint,
-                        RenderAssetUsages::RENDER_WORLD,
-                    ),
+                let mut indices_image = Image::new(
+                    Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    wgpu::TextureDimension::D2,
+                    vec![0, 0, 0, 0],
+                    TextureFormat::R32Uint,
+                    RenderAssetUsages::RENDER_WORLD,
                 );
+                indices_image.immediate_upload = load_settings.immediate_upload;
+                let indices_image =
+                    load_context.add_labeled_asset("dummy_indices".to_owned(), indices_image);
 
                 (pixels_image, indices_image, size.x * size.y * 8)
             };
