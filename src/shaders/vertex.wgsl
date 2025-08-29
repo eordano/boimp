@@ -36,55 +36,10 @@ fn vertex(vertex: Vertex) -> ImposterVertexOut {
     out.inverse_rotation_2c = inv_rot[2];
     out.base_world_position = imposter_world_position;
 
-    // let up = vec3<f32>(0.0, 1.0, 0.0);
     let back = direction_view_to_world(vec3<f32>(0.0, 0.0, 1.0));
-    // let right = cross(up, back);
-    // let up2 = cross(back, right);
-
-    // let view_matrix = transpose(mat3x3(
-    //     normalize(right), 
-    //     normalize(up2), 
-    //     back
-    // ));
-
-    // out.world_position = imposter_world_position + (vertex.position * scale * 2.0) * view_matrix;
     out.world_position = mesh_functions::mesh_position_local_to_world(model, vec4<f32>(vertex.position, 1.0)).xyz;
 
-// #ifndef VIEW_PROJECTION_ORTHOGRAPHIC
-//     let plane_normal = direction_view_to_world(vec3<f32>(0.0, 0.0, 1.0));
-
-//     // shift the calculation base position to the middle of the imposter's depth wrt the camera
-//     var ray_direction = normalize(camera_world_position - out.world_position);
-//     var denom = dot(ray_direction, plane_normal);
-//     if denom > 0.0001 {
-//         let imposter_mid_plane_distance = dot(imposter_world_position - out.world_position, plane_normal) / denom;
-//         out.world_position = out.world_position + imposter_mid_plane_distance * ray_direction;
-//     } else {
-//         // behind the camera, we will just shift forward instead
-//         let center_direction = normalize(camera_world_position - imposter_world_position);
-//         var center_denom = dot(center_direction, plane_normal);
-//         if center_denom > 0.0001 {
-//             let imposter_mid_plane_distance = dot(imposter_world_position - out.world_position, plane_normal) / dot(center_direction, plane_normal);
-//             out.world_position = out.world_position + imposter_mid_plane_distance * center_direction;
-//         } else {
-
-//         }
-//     }
-
-//     // project the actual frag position to the furthest of the front plane of the imposter, and the camera near plane * 0.9
-//     let imposter_front_plane_origin = imposter_world_position + plane_normal * imposter_data.center_and_scale.w;
-//     let imposter_front_plane_distance = dot(imposter_front_plane_origin - out.world_position, plane_normal) / dot(ray_direction, plane_normal);
-
-//     let camera_near_plane_origin = camera_world_position - perspective_camera_near() * back;
-//     let camera_near_plane_distance = dot(camera_near_plane_origin - out.world_position, plane_normal) / dot(ray_direction, plane_normal);
-
-//     let plane_distance = min(camera_near_plane_distance * 0.9, imposter_front_plane_distance);
-
-//     let point_on_plane = out.world_position + plane_distance * 1.0 * ray_direction;
-//     out.position = position_world_to_clip(point_on_plane);
-// #else
     out.position = position_world_to_clip(out.world_position);
-// #endif
 
     return out;
 }
