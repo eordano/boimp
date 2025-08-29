@@ -34,7 +34,7 @@ pub struct ImposterLoaderSettings {
     // if you need more control you can modify the loaded asset (we can't put actual alpha mode here because it doesn't serialize)
     pub alpha_blend: f32,
     pub multisample_amount: f32,
-    immediate_upload: bool,
+    pub immediate_upload: bool,
 }
 
 impl Default for ImposterLoaderSettings {
