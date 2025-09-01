@@ -122,7 +122,7 @@ impl AssetLoader for ImposterLoader {
                     wgpu::TextureDimension::D2,
                     pixels_bytes,
                     TextureFormat::Rg32Uint,
-                    RenderAssetUsages::RENDER_WORLD,
+                    RenderAssetUsages::all(),
                 );
                 pixels_image.immediate_upload = load_settings.immediate_upload;
                 let pixels_image =
@@ -156,7 +156,7 @@ impl AssetLoader for ImposterLoader {
                     wgpu::TextureDimension::D2,
                     indices_bytes,
                     TextureFormat::R32Uint,
-                    RenderAssetUsages::RENDER_WORLD,
+                    RenderAssetUsages::all(),
                 );
                 indices_image.immediate_upload = load_settings.immediate_upload;
                 let indices_image =
@@ -184,7 +184,7 @@ impl AssetLoader for ImposterLoader {
                     wgpu::TextureDimension::D2,
                     pixels_bytes,
                     TextureFormat::Rg32Uint,
-                    RenderAssetUsages::RENDER_WORLD,
+                    RenderAssetUsages::all(),
                 );
                 pixels_image.immediate_upload = load_settings.immediate_upload;
                 let pixels_image =
@@ -199,7 +199,7 @@ impl AssetLoader for ImposterLoader {
                     wgpu::TextureDimension::D2,
                     vec![0, 0, 0, 0],
                     TextureFormat::R32Uint,
-                    RenderAssetUsages::RENDER_WORLD,
+                    RenderAssetUsages::all(),
                 );
                 indices_image.immediate_upload = load_settings.immediate_upload;
                 let indices_image =
