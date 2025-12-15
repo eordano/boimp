@@ -35,6 +35,7 @@ pub struct ImposterLoaderSettings {
     pub alpha_blend: f32,
     pub multisample_amount: f32,
     pub immediate_upload: bool,
+    pub asset_usages: RenderAssetUsages,
 }
 
 impl Default for ImposterLoaderSettings {
@@ -45,6 +46,7 @@ impl Default for ImposterLoaderSettings {
             alpha_blend: 0.0,
             multisample_amount: 0.99,
             immediate_upload: false,
+            asset_usages: Default::default(),
         }
     }
 }
@@ -122,7 +124,7 @@ impl AssetLoader for ImposterLoader {
                     wgpu::TextureDimension::D2,
                     pixels_bytes,
                     TextureFormat::Rg32Uint,
-                    RenderAssetUsages::all(),
+                    load_settings.asset_usages,
                 );
                 pixels_image.immediate_upload = load_settings.immediate_upload;
                 let pixels_image =
@@ -156,7 +158,7 @@ impl AssetLoader for ImposterLoader {
                     wgpu::TextureDimension::D2,
                     indices_bytes,
                     TextureFormat::R32Uint,
-                    RenderAssetUsages::all(),
+                    load_settings.asset_usages,
                 );
                 indices_image.immediate_upload = load_settings.immediate_upload;
                 let indices_image =
@@ -184,7 +186,7 @@ impl AssetLoader for ImposterLoader {
                     wgpu::TextureDimension::D2,
                     pixels_bytes,
                     TextureFormat::Rg32Uint,
-                    RenderAssetUsages::all(),
+                    load_settings.asset_usages,
                 );
                 pixels_image.immediate_upload = load_settings.immediate_upload;
                 let pixels_image =
@@ -199,7 +201,7 @@ impl AssetLoader for ImposterLoader {
                     wgpu::TextureDimension::D2,
                     vec![0, 0, 0, 0],
                     TextureFormat::R32Uint,
-                    RenderAssetUsages::all(),
+                    load_settings.asset_usages,
                 );
                 indices_image.immediate_upload = load_settings.immediate_upload;
                 let indices_image =
