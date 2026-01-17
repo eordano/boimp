@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::anyhow;
 use bevy::{
-    asset::AssetLoader,
+    asset::{AssetLoader, RenderAssetTransferPriority},
     log::{debug, info},
     math::{UVec2, Vec3},
     prelude::{AlphaMode, Image},
@@ -34,7 +34,7 @@ pub struct ImposterLoaderSettings {
     // if you need more control you can modify the loaded asset (we can't put actual alpha mode here because it doesn't serialize)
     pub alpha_blend: f32,
     pub multisample_amount: f32,
-    pub immediate_upload: bool,
+    pub transfer_priority: RenderAssetTransferPriority,
     pub asset_usages: RenderAssetUsages,
 }
 
@@ -45,7 +45,7 @@ impl Default for ImposterLoaderSettings {
             alpha: 1.0,
             alpha_blend: 0.0,
             multisample_amount: 0.99,
-            immediate_upload: false,
+            transfer_priority: RenderAssetTransferPriority::default(),
             asset_usages: Default::default(),
         }
     }
@@ -126,7 +126,7 @@ impl AssetLoader for ImposterLoader {
                     TextureFormat::Rg32Uint,
                     load_settings.asset_usages,
                 );
-                pixels_image.immediate_upload = load_settings.immediate_upload;
+                pixels_image.transfer_priority = load_settings.transfer_priority;
                 let pixels_image =
                     load_context.add_labeled_asset("pixels".to_owned(), pixels_image);
 
@@ -160,7 +160,7 @@ impl AssetLoader for ImposterLoader {
                     TextureFormat::R32Uint,
                     load_settings.asset_usages,
                 );
-                indices_image.immediate_upload = load_settings.immediate_upload;
+                indices_image.transfer_priority = load_settings.transfer_priority;
                 let indices_image =
                     load_context.add_labeled_asset("indices".to_owned(), indices_image);
                 (
@@ -188,7 +188,7 @@ impl AssetLoader for ImposterLoader {
                     TextureFormat::Rg32Uint,
                     load_settings.asset_usages,
                 );
-                pixels_image.immediate_upload = load_settings.immediate_upload;
+                pixels_image.transfer_priority = load_settings.transfer_priority;
                 let pixels_image =
                     load_context.add_labeled_asset("texture".to_owned(), pixels_image);
 
@@ -203,7 +203,7 @@ impl AssetLoader for ImposterLoader {
                     TextureFormat::R32Uint,
                     load_settings.asset_usages,
                 );
-                indices_image.immediate_upload = load_settings.immediate_upload;
+                indices_image.transfer_priority = load_settings.transfer_priority;
                 let indices_image =
                     load_context.add_labeled_asset("dummy_indices".to_owned(), indices_image);
 
