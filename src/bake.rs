@@ -260,8 +260,8 @@ where
     }
 }
 
-impl<B: Material, E: MaterialExtension + ImposterBakeMaterialExtension> ImposterBakeMaterial
-    for ExtendedMaterial<B, E>
+impl<E: MaterialExtension + ImposterBakeMaterialExtension> ImposterBakeMaterial
+    for ExtendedMaterial<E>
 {
     fn imposter_fragment_shader() -> ShaderRef {
         E::imposter_fragment_shader()
