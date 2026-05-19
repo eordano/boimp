@@ -6,7 +6,12 @@
 
 #import boimp::shared::{compose_over, pack_pbrinput, pack_props, unpack_props};
 
-@group(3) @binding(0) var bake_target: texture_storage_2d<rg32uint, read_write>;
+struct BakeDims {
+    width: u32,
+}
+
+@group(3) @binding(0) var<storage, read_write> bake_buffer: array<vec2<u32>>;
+@group(3) @binding(1) var<uniform> bake_dims: BakeDims;
 
 @fragment
 fn fragment(
@@ -24,12 +29,13 @@ fn fragment(
         discard;
     }
 
-    // composite the new fragment over whatever's already at this pixel in the bake target.
+    // composite the new fragment over whatever's already at this pixel in the bake buffer.
     let new_packed = pack_pbrinput(pbr_input);
     let new_props = unpack_props(new_packed);
 
-    let pixel = vec2<i32>(in.position.xy);
-    let existing = unpack_props(textureLoad(bake_target, pixel));
+    let pixel = vec2<u32>(in.position.xy);
+    let idx = pixel.y * bake_dims.width + pixel.x;
+    let existing = unpack_props(bake_buffer[idx]);
     let composed = compose_over(existing, new_props);
-    textureStore(bake_target, pixel, pack_props(composed));
+    bake_buffer[idx] = pack_props(composed);
 }
