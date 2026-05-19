@@ -4,30 +4,32 @@
     pbr_functions::alpha_discard,
 }
 
-#import boimp::shared::pack_pbrinput;
+#import boimp::shared::{compose_over, pack_pbrinput, pack_props, unpack_props};
+
+@group(3) @binding(0) var bake_target: texture_storage_2d<rg32uint, read_write>;
 
 @fragment
 fn fragment(
     in: VertexOutput,
     @builtin(front_facing) is_front: bool,
-) -> @location(0) vec2<u32> {
+) {
     // generate a PbrInput struct from the StandardMaterial bindings
     var pbr_input = pbr_input_from_standard_material(in, is_front);
 
-    // alpha discard
+    // material-specific alpha handling (mask cutoff / opaque snap / blend preserve)
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
 
-    // we can only store a single result, so we're going to unilaterally discard alpha < 0.5
-    // todo: optionally we could
-    // - run opaque
-    // - copy texture out
-    // - provide texture as input to alpha mat rendering
-    // for materials to merge more intelligently
-    if pbr_input.material.base_color.a < 0.5 {
+    // skip fully transparent fragments (no contribution to the composite)
+    if pbr_input.material.base_color.a <= 0.0 {
         discard;
     }
 
-    // write the imposter gbuffer
-    return pack_pbrinput(pbr_input);
-}
+    // composite the new fragment over whatever's already at this pixel in the bake target.
+    let new_packed = pack_pbrinput(pbr_input);
+    let new_props = unpack_props(new_packed);
 
+    let pixel = vec2<i32>(in.position.xy);
+    let existing = unpack_props(textureLoad(bake_target, pixel));
+    let composed = compose_over(existing, new_props);
+    textureStore(bake_target, pixel, pack_props(composed));
+}

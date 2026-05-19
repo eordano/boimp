@@ -184,6 +184,30 @@ fn weighted_props(a: UnpackedMaterialProps, b: UnpackedMaterialProps, weight_a: 
     return out;
 }
 
+// Porter-duff "over": composite `new` on top of `existing`. Hardware
+// depth-test arbitrates which fragments reach the shader (opaque: closest
+// wins; transparent: all passing fragments execute), and we rely on the
+// rendering pipeline's order for transparent overlap. Existing samples
+// with `a == 0` are the storage-texture sentinel for "nothing here yet".
+//
+// `new`'s normal / depth / roughness / metallic / flags become the result's
+// — for opaque this is the closest surface (correct), for transparent over
+// opaque this is the transparent's parallax/orientation (a known limitation
+// of single-surface imposters but no worse than before).
+fn compose_over(existing: UnpackedMaterialProps, new: UnpackedMaterialProps) -> UnpackedMaterialProps {
+    if existing.rgba.a <= 0.0 {
+        return new;
+    }
+    let a_out = new.rgba.a + existing.rgba.a * (1.0 - new.rgba.a);
+    if a_out <= 0.0 {
+        return new;
+    }
+    let rgb_out = (new.rgba.rgb * new.rgba.a + existing.rgba.rgb * existing.rgba.a * (1.0 - new.rgba.a)) / a_out;
+    var out = new;
+    out.rgba = vec4<f32>(rgb_out, a_out);
+    return out;
+}
+
 fn unpack_pbrinput(props: UnpackedMaterialProps, frag_coord: vec4<f32>) -> PbrInput {
     var input = pbr_input_new();
 

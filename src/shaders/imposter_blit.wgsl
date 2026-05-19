@@ -1,5 +1,5 @@
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
-#import boimp::shared::{unpack_props, weighted_props, pack_props, UnpackedMaterialProps};
+#import boimp::shared::{pack_props, unpack_props, weighted_props, UnpackedMaterialProps};
 
 struct BlitData {
     samples: u32,
@@ -10,13 +10,14 @@ struct BlitData {
 
 @group(0) @binding(0) var source: texture_2d<u32>;
 @group(0) @binding(1) var<uniform> data: BlitData;
+@group(0) @binding(2) var output: texture_storage_2d<rg32uint, write>;
+
 @fragment
-fn blend_materials(in: FullscreenVertexOutput) -> @location(0) vec2<u32> {
+fn blend_materials(in: FullscreenVertexOutput) {
     let source_dims = textureDimensions(source);
     let target_dims = source_dims / data.samples;
-    
+
     let target_pixel = vec2<u32>(in.uv * vec2<f32>(target_dims));
-    let viewport_pixel = target_pixel * data.samples;
 
     var y_samples: array<UnpackedMaterialProps,8>;
     var y_end = data.samples;
@@ -48,6 +49,5 @@ fn blend_materials(in: FullscreenVertexOutput) -> @location(0) vec2<u32> {
         }
     }
 
-    return pack_props(y_samples[0]);
+    textureStore(output, vec2<i32>(in.position.xy), pack_props(y_samples[0]));
 }
-
