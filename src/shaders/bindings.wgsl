@@ -227,8 +227,15 @@ fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offse
         return pixel;
 #else
         let pixel_depth = single_sample(coords_unadjusted, bounds_min, bounds_max);
-        let depth = pixel_depth.depth;
-        let coords = coords_unadjusted + depth * uv_and_dd.zw * vec2<f32>(imposter_data.base_tile_size);
+        // If the first read landed on a pixel that was never written by the
+        // bake (alpha=0 — outside the silhouette), the unpacked depth defaults
+        // to -1 from the zero storage state, not a real depth. Skip parallax
+        // in that case — multisample is naturally robust here via weighted_props
+        // alpha-weighting, but a single point read isn't.
+        var coords = coords_unadjusted;
+        if pixel_depth.rgba.a > 0.0 {
+            coords = coords_unadjusted + pixel_depth.depth * uv_and_dd.zw * vec2<f32>(imposter_data.base_tile_size);
+        }
         let pixel = single_sample(coords, bounds_min, bounds_max);
 
         return pixel;
