@@ -2,7 +2,7 @@
 
 #import bevy_pbr::{
     pbr_types::{PbrInput, STANDARD_MATERIAL_FLAGS_UNLIT_BIT, pbr_input_new},
-    view_transformations::{position_ndc_to_world, frag_coord_to_ndc},
+    view_transformations::{position_ndc_to_world, frag_coord_to_ndc, position_world_to_clip},
     pbr_functions::calculate_view,
     mesh_view_bindings::view,
 };
@@ -182,6 +182,36 @@ fn weighted_props(a: UnpackedMaterialProps, b: UnpackedMaterialProps, weight_a: 
     out.depth = a.depth * wa + b.depth * wb;
     out.flags = select(a.flags, b.flags, wa < wb);
     return out;
+}
+
+// Convert a sample's parallax depth (where the surface sits inside the
+// *source* imposter's volume) into the current bake camera's NDC z mapped
+// to the [-1, 1] UnpackedMaterialProps convention. Mirrors the inverse
+// operation used in fragment.wgsl when rendering an imposter — the level-N
+// bake camera projects the recovered world-space surface point back into
+// its own clip space so the stored depth has the right meaning at level
+// N+1 (and is comparable to the standard-material baker's stored depth).
+fn parallax_depth_to_bake_ndc(
+    quad_world_position: vec3<f32>,
+    back: vec3<f32>,
+    parallax_depth: f32,
+    parallax_scale: f32,
+) -> f32 {
+    let surface_world = quad_world_position + back * parallax_depth * parallax_scale;
+    let clip = position_world_to_clip(surface_world);
+    let ndc_z = clip.z / clip.w;
+    return ndc_z * 2.0 - 1.0;
+}
+
+// Manual depth check. Storage-buffer writes from a fragment shader bypass
+// the hardware depth/stencil test (per WebGPU spec), so multiple fragments
+// at the same pixel would otherwise all write into bake_buffer and the
+// last-rendered wins instead of the closest. Skip the new fragment if
+// there is already an opaque pixel in front of us; for translucent or
+// empty existing we accept order-dependence and composite anyway.
+// Bevy reverse-z: higher depth = closer.
+fn passes_depth_check(new_depth: f32, existing: UnpackedMaterialProps) -> bool {
+    return new_depth >= existing.depth || existing.rgba.a < 1.0;
 }
 
 // Porter-duff "over": composite `incoming` on top of `existing`. Hardware

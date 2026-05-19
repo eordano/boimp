@@ -4,7 +4,7 @@
     pbr_functions::alpha_discard,
 }
 
-#import boimp::shared::{compose_over, pack_pbrinput, pack_props, unpack_props};
+#import boimp::shared::{compose_over, pack_pbrinput, pack_props, passes_depth_check, unpack_props};
 
 struct BakeDims {
     width: u32,
@@ -36,6 +36,9 @@ fn fragment(
     let pixel = vec2<u32>(in.position.xy);
     let idx = pixel.y * bake_dims.width + pixel.x;
     let existing = unpack_props(bake_buffer[idx]);
+    if !passes_depth_check(new_props.depth, existing) {
+        discard;
+    }
     let composed = compose_over(existing, new_props);
     bake_buffer[idx] = pack_props(composed);
 }

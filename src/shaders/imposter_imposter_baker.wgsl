@@ -1,5 +1,11 @@
-#import boimp::shared::{ImposterVertexOut, compose_over, pack_props, unpack_props, weighted_props};
-#import boimp::bindings::{sample_positions_from_camera_dir, sample_tile_material, sample_uvs_unbounded};
+#import boimp::shared::{
+    ImposterVertexOut, compose_over, pack_props, parallax_depth_to_bake_ndc,
+    passes_depth_check, unpack_props, weighted_props,
+};
+#import boimp::bindings::{
+    imposter_data, sample_positions_from_camera_dir, sample_tile_material,
+    sample_uvs_unbounded,
+};
 
 #import bevy_pbr::view_transformations::{direction_view_to_world, position_view_to_world};
 
@@ -52,15 +58,24 @@ fn fragment(in: ImposterVertexOut) {
         discard;
     }
 
-    // rotate the sampled normal into world space. depth stays as the source
-    // imposter's parallax-correction depth — it represents where the surface
-    // sits inside the imposter volume, not bake-camera screen depth.
     var new_props = props_final;
     new_props.normal = inv_rot * normalize(new_props.normal);
+    // Re-project the recovered surface position into the *new* bake camera's
+    // clip space so the stored depth is in the new mip's own coordinate
+    // system (same convention as the standard-material baker stores).
+    new_props.depth = parallax_depth_to_bake_ndc(
+        in.world_position,
+        back,
+        props_final.depth,
+        imposter_data.center_and_scale.w,
+    );
 
     let pixel = vec2<u32>(in.position.xy);
     let idx = pixel.y * bake_dims.width + pixel.x;
     let existing = unpack_props(bake_buffer[idx]);
+    if !passes_depth_check(new_props.depth, existing) {
+        discard;
+    }
     let composed = compose_over(existing, new_props);
     bake_buffer[idx] = pack_props(composed);
 }
