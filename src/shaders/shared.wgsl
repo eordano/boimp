@@ -185,12 +185,12 @@ fn weighted_props(a: UnpackedMaterialProps, b: UnpackedMaterialProps, weight_a: 
 }
 
 // Convert a sample's parallax depth (where the surface sits inside the
-// *source* imposter's volume) into the current bake camera's NDC z mapped
-// to the [-1, 1] UnpackedMaterialProps convention. Mirrors the inverse
-// operation used in fragment.wgsl when rendering an imposter — the level-N
-// bake camera projects the recovered world-space surface point back into
-// its own clip space so the stored depth has the right meaning at level
-// N+1 (and is comparable to the standard-material baker's stored depth).
+// *source* imposter's volume) into the current bake camera's NDC z (the
+// raw `frag_coord.z`-style [0, 1] value that `pack_pbrinput` stores).
+// Mirrors the inverse operation used in fragment.wgsl when rendering an
+// imposter — the level-N bake camera projects the recovered world-space
+// surface point back into its own clip space so the stored depth has
+// the right meaning at level N+1.
 fn parallax_depth_to_bake_ndc(
     quad_world_position: vec3<f32>,
     back: vec3<f32>,
@@ -199,8 +199,7 @@ fn parallax_depth_to_bake_ndc(
 ) -> f32 {
     let surface_world = quad_world_position + back * parallax_depth * parallax_scale;
     let clip = position_world_to_clip(surface_world);
-    let ndc_z = clip.z / clip.w;
-    return ndc_z * 2.0 - 1.0;
+    return clip.z / clip.w;
 }
 
 // Manual depth check. Storage-buffer writes from a fragment shader bypass

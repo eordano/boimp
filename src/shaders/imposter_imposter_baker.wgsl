@@ -1,6 +1,7 @@
 #import boimp::shared::{
-    ImposterVertexOut, compose_over, pack_props, parallax_depth_to_bake_ndc,
-    passes_depth_check, unpack_props, weighted_props,
+    ImposterVertexOut, compose_over, pack_pbrinput, pack_props,
+    parallax_depth_to_bake_ndc, passes_depth_check, unpack_pbrinput, unpack_props,
+    weighted_props,
 };
 #import boimp::bindings::{
     imposter_data, sample_positions_from_camera_dir, sample_tile_material,
@@ -58,17 +59,22 @@ fn fragment(in: ImposterVertexOut) {
         discard;
     }
 
-    var new_props = props_final;
-    new_props.normal = inv_rot * normalize(new_props.normal);
+    var pbr_input = unpack_pbrinput(props_final, in.position);
+    pbr_input.N = inv_rot * normalize(pbr_input.N);
+    pbr_input.world_normal = pbr_input.N;
     // Re-project the recovered surface position into the *new* bake camera's
     // clip space so the stored depth is in the new mip's own coordinate
-    // system (same convention as the standard-material baker stores).
-    new_props.depth = parallax_depth_to_bake_ndc(
+    // system — same convention `pack_pbrinput` expects from the standard
+    // material baker (raw frag_coord.z, [0, 1]).
+    pbr_input.frag_coord.z = parallax_depth_to_bake_ndc(
         in.world_position,
         back,
         props_final.depth,
         imposter_data.center_and_scale.w,
     );
+
+    let new_packed = pack_pbrinput(pbr_input);
+    let new_props = unpack_props(new_packed);
 
     let pixel = vec2<u32>(in.position.xy);
     let idx = pixel.y * bake_dims.width + pixel.x;
