@@ -44,17 +44,17 @@ use bevy::{
             ViewSortedRenderPhases,
         },
         render_resource::{
-            binding_types::{texture_2d, uniform_buffer},
+            binding_types::{texture_2d, texture_storage_2d, uniform_buffer},
             BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries, Buffer,
-            BufferDescriptor, CachedRenderPipelineId, ColorTargetState, ColorWrites,
-            CommandEncoderDescriptor, Extent3d, FragmentState, PipelineCache, RenderPassDescriptor,
-            RenderPipelineDescriptor, ShaderDefVal, ShaderRef, ShaderType, SpecializedMeshPipeline,
-            SpecializedMeshPipelines, StoreOp, Texture, TextureDescriptor, TextureDimension,
+            BufferDescriptor, CachedRenderPipelineId, CommandEncoderDescriptor, Extent3d,
+            FragmentState, PipelineCache, RenderPassDescriptor, RenderPipelineDescriptor,
+            ShaderDefVal, ShaderRef, ShaderType, SpecializedMeshPipeline, SpecializedMeshPipelines,
+            StorageTextureAccess, StoreOp, Texture, TextureDescriptor, TextureDimension,
             TextureFormat, TextureUsages, UniformBuffer,
         },
         renderer::{RenderDevice, RenderQueue},
         sync_world::{MainEntity, RenderEntity, SyncToRenderWorld},
-        texture::{ColorAttachment, GpuImage, TextureCache},
+        texture::{CachedTexture, GpuImage, TextureCache},
         view::{
             ColorGrading, ExtractedView, NoFrustumCulling, NoIndirectDrawing,
             PreviousVisibleEntities, RenderLayers, RenderVisibleEntities, RetainedViewEntity,
@@ -193,7 +193,31 @@ impl Plugin for ImposterBakePlugin {
             return;
         };
 
-        render_app.init_resource::<ImposterBlitPipeline>();
+        render_app
+            .init_resource::<BakeStorageBindGroupLayout>()
+            .init_resource::<ImposterBlitPipeline>();
+    }
+}
+
+/// Bind group layout for the storage-texture bake target. Bake fragment shaders
+/// import a binding at `@group(3) @binding(0)` with this layout and do
+/// `textureLoad` + composite + `textureStore` against it. The render node binds
+/// the actual `intermediate` (or `output` if multisample==1) texture at that
+/// slot before each bake render pass.
+#[derive(Resource)]
+pub struct BakeStorageBindGroupLayout(pub BindGroupLayout);
+
+impl FromWorld for BakeStorageBindGroupLayout {
+    fn from_world(world: &mut World) -> Self {
+        let device = world.resource::<RenderDevice>();
+        let layout = device.create_bind_group_layout(
+            "imposter_bake_storage_layout",
+            &BindGroupLayoutEntries::single(
+                ShaderStages::FRAGMENT,
+                texture_storage_2d(TextureFormat::Rg32Uint, StorageTextureAccess::ReadWrite),
+            ),
+        );
+        Self(layout)
     }
 }
 
@@ -905,6 +929,7 @@ fn copy_preprocess_bindgroups(
 pub struct ImposterBakePipeline<M: ImposterBakeMaterial> {
     prepass_pipeline: PrepassPipeline<M>,
     frag_shader: Handle<Shader>,
+    storage_layout: BindGroupLayout,
 }
 
 impl<M: ImposterBakeMaterial> FromWorld for ImposterBakePipeline<M> {
@@ -916,6 +941,7 @@ impl<M: ImposterBakeMaterial> FromWorld for ImposterBakePipeline<M> {
                 ShaderRef::Handle(handle) => handle,
                 ShaderRef::Path(path) => world.resource::<AssetServer>().load(path),
             },
+            storage_layout: world.resource::<BakeStorageBindGroupLayout>().0.clone(),
         }
     }
 }
@@ -1002,17 +1028,18 @@ where
             defs.push("VERTEX_TANGENTS".into());
         }
 
-        // replace frag state
+        // replace frag state. no color attachment: bake fragment shaders write
+        // into the storage-texture bake target instead.
         descriptor.fragment = Some(FragmentState {
             shader: self.frag_shader.clone(),
             shader_defs: frag_defs,
             entry_point: "fragment".into(),
-            targets: vec![Some(ColorTargetState {
-                format: TextureFormat::Rg32Uint,
-                blend: None,
-                write_mask: ColorWrites::ALL,
-            })],
+            targets: vec![],
         });
+
+        // append our storage-texture bind group layout. assumes the prepass
+        // pipeline put view/mesh/material at 0/1/2.
+        descriptor.layout.push(self.storage_layout.clone());
 
         Ok(descriptor)
     }
@@ -1044,6 +1071,7 @@ impl FromWorld for ImposterBlitPipeline {
                 (
                     texture_2d(wgpu::TextureSampleType::Uint),
                     uniform_buffer::<BlitUniform>(false),
+                    texture_storage_2d(TextureFormat::Rg32Uint, StorageTextureAccess::WriteOnly),
                 ),
             ),
         );
@@ -1056,11 +1084,7 @@ impl FromWorld for ImposterBlitPipeline {
                 shader: IMPOSTER_BLIT_HANDLE,
                 shader_defs: Vec::default(),
                 entry_point: "blend_materials".into(),
-                targets: vec![Some(ColorTargetState {
-                    format: TextureFormat::Rg32Uint,
-                    blend: None,
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets: vec![],
             }),
             depth_stencil: None,
             push_constant_ranges: Default::default(),
@@ -1075,12 +1099,15 @@ impl FromWorld for ImposterBlitPipeline {
 
 #[derive(Component)]
 pub struct ImposterResources {
-    pub output: ColorAttachment,
-    pub intermediate: Option<ColorAttachment>,
+    pub output: CachedTexture,
+    pub intermediate: Option<CachedTexture>,
     pub depth: ViewDepthTexture,
     pub target: Option<Texture>,
     pub blit_buffer: Option<UniformBuffer<BlitUniform>>,
     pub blit_bindgroup: Option<BindGroup>,
+    /// Storage-texture bind group used by the bake render pass to read/write
+    /// the current bake target (intermediate if multisample>1, else output).
+    pub bake_bindgroup: BindGroup,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1093,6 +1120,7 @@ pub fn prepare_imposter_textures(
     views: Query<(Entity, &ExtractedImposterBakeCamera)>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
+    storage_layout: Res<BakeStorageBindGroupLayout>,
 ) {
     for (entity, camera) in views.iter() {
         if !opaque_phases.contains_key(&camera.retained_view_entity) {
@@ -1172,10 +1200,23 @@ pub fn prepare_imposter_textures(
         };
         let depth_texture = texture_cache.get(&render_device, depth_descriptor);
 
+        // Bake target is intermediate (high-res) for multisample > 1, else the
+        // final output texture directly. Either way it's bound as a read-write
+        // storage texture so the fragment shader can do textureLoad + composite
+        // + textureStore.
+        let bake_target_view = intermediate
+            .as_ref()
+            .map(|i| &i.default_view)
+            .unwrap_or(&texture.default_view);
+        let bake_bindgroup = render_device.create_bind_group(
+            "imposter_bake_storage_group",
+            &storage_layout.0,
+            &BindGroupEntries::single(bake_target_view),
+        );
+
         commands.entity(entity).insert(ImposterResources {
-            output: ColorAttachment::new(texture, None, Some(LinearRgba::BLACK)),
-            intermediate: intermediate
-                .map(|i| ColorAttachment::new(i, None, Some(LinearRgba::BLACK))),
+            output: texture,
+            intermediate,
             depth: ViewDepthTexture::new(depth_texture, Some(0.0)),
             target: camera
                 .target
@@ -1184,6 +1225,7 @@ pub fn prepare_imposter_textures(
                 .map(|image| image.texture.clone()),
             blit_buffer,
             blit_bindgroup: None,
+            bake_bindgroup,
         });
     }
 }
@@ -1199,8 +1241,9 @@ pub fn prepare_imposter_bindgroups(
                 "imposter_blit_group",
                 &pipeline.layout,
                 &BindGroupEntries::sequential((
-                    &res.intermediate.as_ref().unwrap().texture.default_view,
+                    &res.intermediate.as_ref().unwrap().default_view,
                     res.blit_buffer.as_ref().unwrap().binding().unwrap().clone(),
+                    &res.output.default_view,
                 )),
             );
 
@@ -1444,23 +1487,35 @@ impl ViewNode for ImposterBakeNode {
                 .copied()
                 .unwrap_or_default();
 
-            if camera.multisample == 1 {
-                if rendered > 0 {
-                    // grab the attachments once to disable clearing
-                    textures.output.get_attachment();
-                    textures.depth.get_attachment(StoreOp::Store);
+            // First run for this view: clear the bake target(s). Subsequent
+            // tiles within the same camera read/composite against existing
+            // contents so we don't clear again.
+            if rendered == 0 {
+                let bake_target = textures
+                    .intermediate
+                    .as_ref()
+                    .unwrap_or(&textures.output)
+                    .texture
+                    .clone();
+                command_encoder.clear_texture(&bake_target, &Default::default());
+                if camera.multisample > 1 {
+                    // we also write into output via the blit pass; clear it too
+                    command_encoder.clear_texture(&textures.output.texture, &Default::default());
                 }
+            }
 
-                // use a single renderpass
-                // Render pass setup
+            if camera.multisample == 1 {
+                // single-pass: bake target IS the final output, written via the
+                // storage texture binding. no color attachment.
                 let render_pass = command_encoder.begin_render_pass(&RenderPassDescriptor {
                     label: Some("imposter_bake"),
-                    color_attachments: &[Some(textures.output.get_attachment())],
+                    color_attachments: &[],
                     depth_stencil_attachment: Some(textures.depth.get_attachment(StoreOp::Store)),
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
                 let mut render_pass = TrackedRenderPass::new(&render_device, render_pass);
+                render_pass.set_bind_group(3, &textures.bake_bindgroup, &[]);
 
                 if rendered == 0 {
                     // run once to check if all the items are ready and rendering
@@ -1513,13 +1568,9 @@ impl ViewNode for ImposterBakeNode {
 
                 drop(render_pass);
             } else {
-                // manual multisample resolve requires multiple passes
-                let should_clear = rendered == 0;
-
-                // store the attachments so we keep the initial clears
-                let color_attachments = [Some(
-                    textures.intermediate.as_ref().unwrap().get_attachment(),
-                )];
+                // multisample: bake to intermediate via storage texture, then
+                // blit-resolve into output via a fullscreen pass that also
+                // writes via storage texture.
                 let depth_attachment = Some(textures.depth.get_attachment(StoreOp::Store));
 
                 for (x, y, view) in camera
@@ -1528,15 +1579,15 @@ impl ViewNode for ImposterBakeNode {
                     .skip(rendered)
                     .take(camera.max_tiles_per_frame)
                 {
-                    // Render pass setup
                     let render_pass = command_encoder.begin_render_pass(&RenderPassDescriptor {
                         label: Some("imposter_bake"),
-                        color_attachments: &color_attachments,
+                        color_attachments: &[],
                         depth_stencil_attachment: depth_attachment.clone(),
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
                     let mut render_pass = TrackedRenderPass::new(&render_device, render_pass);
+                    render_pass.set_bind_group(3, &textures.bake_bindgroup, &[]);
                     let _ = opaque_phase.render(&mut render_pass, world, *view);
                     let _ = alphamask_phase.render(&mut render_pass, world, *view);
                     let _ = transparent_phase.render(&mut render_pass, world, *view);
@@ -1556,14 +1607,9 @@ impl ViewNode for ImposterBakeNode {
                     drop(render_pass);
                     rendered += 1;
 
-                    // copy it
-                    if !should_clear {
-                        // grab the attachments once to disable clearing
-                        textures.output.get_attachment();
-                    }
                     let mut pass = command_encoder.begin_render_pass(&RenderPassDescriptor {
                         label: Some("imposter_blit"),
-                        color_attachments: &[Some(textures.output.get_attachment())],
+                        color_attachments: &[],
                         depth_stencil_attachment: None,
                         timestamp_writes: None,
                         occlusion_query_set: None,
@@ -1609,7 +1655,7 @@ impl ViewNode for ImposterBakeNode {
                     });
 
                     command_encoder.copy_texture_to_buffer(
-                        textures.output.texture.texture.as_image_copy(),
+                        textures.output.texture.as_image_copy(),
                         TexelCopyBufferInfo {
                             buffer: &buffer,
                             layout: TexelCopyBufferLayout {
@@ -1651,7 +1697,7 @@ impl ViewNode for ImposterBakeNode {
                 // copy it to the output
                 if let Some(target) = textures.target.as_ref() {
                     command_encoder.copy_texture_to_texture(
-                        textures.output.texture.texture.as_image_copy(),
+                        textures.output.texture.as_image_copy(),
                         target.as_image_copy(),
                         Extent3d {
                             width: camera.tile_size * camera.grid_size,
