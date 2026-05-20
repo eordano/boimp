@@ -284,6 +284,10 @@ where
         };
 
         render_app
+            // ImposterBakePipeline::from_world reads this resource; depending on
+            // the order plugin finish() runs, it may not yet be initialized by
+            // ImposterBakePlugin::finish. init_resource is idempotent.
+            .init_resource::<BakeStorageBindGroupLayout>()
             .init_resource::<ImposterBakePipeline<M>>()
             .init_resource::<SpecializedMeshPipelines<ImposterBakePipeline<M>>>()
             .add_render_command::<ImposterPhaseItem<Opaque3d>, DrawImposter<M>>()
