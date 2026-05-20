@@ -144,7 +144,10 @@ impl Plugin for ImposterBakePlugin {
             .init_resource::<ImposterActualRenderCount>()
             .init_resource::<ImpostersBaked>()
             .init_resource::<PartBaked>()
-            .add_systems(ExtractSchedule, extract_imposter_cameras)
+            .add_systems(
+                ExtractSchedule,
+                (extract_imposter_cameras, despawn_orphaned_imposter_subviews),
+            )
             .add_systems(
                 Render,
                 (
@@ -624,6 +627,16 @@ pub struct ExtractedImposterBakeCamera {
     pub callback: Option<ImageCallback>,
 }
 
+/// Tags the per-tile render-world view entities spawned by
+/// `extract_imposter_cameras` with their owning render-world bake camera.
+/// Bevy's render-entity sync only despawns entities mirrored from the main
+/// world, so these standalone children would otherwise outlive their owner
+/// indefinitely and inflate per-view PBR systems (notably
+/// `upload_light_probes`). `despawn_orphaned_imposter_subviews` reaps them
+/// once the owner is gone.
+#[derive(Component)]
+struct ImposterSubview(Entity);
+
 #[derive(PartialEq, Eq, Hash)]
 pub struct ImposterPhaseItem<T: 'static> {
     inner: T,
@@ -869,7 +882,9 @@ pub fn extract_imposter_cameras(
                     color_grading: ColorGrading::default(),
                 };
 
-                let id = commands.spawn((view, NoIndirectDrawing)).id();
+                let id = commands
+                    .spawn((view, NoIndirectDrawing, ImposterSubview(render_entity)))
+                    .id();
 
                 subviews.push((x, y, id));
             }
@@ -928,6 +943,18 @@ pub fn extract_imposter_cameras(
         .lock()
         .unwrap()
         .retain(|entity, _| entities.contains(entity));
+}
+
+fn despawn_orphaned_imposter_subviews(
+    mut commands: Commands,
+    subviews: Query<(Entity, &ImposterSubview)>,
+    parents: Query<(), With<ExtractedImposterBakeCamera>>,
+) {
+    for (ent, ImposterSubview(parent)) in subviews.iter() {
+        if !parents.contains(*parent) {
+            commands.entity(ent).despawn();
+        }
+    }
 }
 
 fn copy_preprocess_bindgroups(
