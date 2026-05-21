@@ -30,7 +30,18 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
     let back_vec = camera_world_position - in.base_world_position;
 #endif
 
+    // For looking-up views past horizontal, snap to the closest in-grid
+    // angle (the horizon ring). The grid has no tile coverage above
+    // horizontal in hemispherical mode, so without this the closest-3
+    // tiles selection swings to whatever's nearest in uv and the
+    // imposter jumps; clamping freezes it at its horizontal appearance.
+    // Only applies in hemispherical mode — spherical covers all
+    // directions and horizontal mode is a 1D ring around the equator.
+#ifdef GRID_HEMISPHERICAL
+    let back = normalize(vec3<f32>(back_vec.x, max(back_vec.y, 0.0), back_vec.z));
+#else
     let back = normalize(back_vec);
+#endif
 
     let samples = sample_positions_from_camera_dir(back * inv_rot);
 
