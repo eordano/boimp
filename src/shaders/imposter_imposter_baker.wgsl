@@ -66,8 +66,14 @@ fn fragment(in: ImposterVertexOut) {
     // clip space so the stored depth is in the new mip's own coordinate
     // system — same convention `pack_pbrinput` expects from the standard
     // material baker (raw frag_coord.z, [0, 1]).
+    //
+    // The level-0 encoding is `depth = (P - C_child) · T / scale`, i.e. an
+    // offset from the *imposter center*. Reconstruct from the center
+    // (`base_world_position`), not from a point on the cube face
+    // (`world_position`) — that would add a geometric-vs-parallax-scale
+    // bias to every fragment and warp the depth as the camera moves.
     pbr_input.frag_coord.z = parallax_depth_to_bake_ndc(
-        in.world_position,
+        in.base_world_position,
         back,
         props_final.depth,
         imposter_data.center_and_scale.w,

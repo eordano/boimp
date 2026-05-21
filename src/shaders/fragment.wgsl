@@ -63,7 +63,11 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
 #ifdef DEPTH_PREPASS
 #ifndef PREPASS_PIPELINE
     let existing_depth_ndc = bevy_pbr::prepass_utils::prepass_depth(in.position, 0u);
-    let imposted_ndc = position_world_to_clip(in.world_position + back * props_final.depth * imposter_data.center_and_scale.w);
+    // Reconstruct surface from imposter *center* (`base_world_position`),
+    // not from the cube-face fragment position. The stored depth encodes
+    // `(P - C) · T / scale`, so the center is the correct origin to add
+    // the parallax offset to.
+    let imposted_ndc = position_world_to_clip(in.base_world_position + back * props_final.depth * imposter_data.center_and_scale.w);
     let imposter_depth_ndc = imposted_ndc.z / imposted_ndc.w;
     
     if imposter_depth_ndc < existing_depth_ndc {
