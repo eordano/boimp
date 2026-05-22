@@ -175,7 +175,16 @@ fn weighted_props(a: UnpackedMaterialProps, b: UnpackedMaterialProps, weight_a: 
     let wa = raw_wa / total_weight;
     let wb = raw_wb / total_weight;
 
-    out.rgba = vec4(a.rgba.rgb * wa + b.rgba.rgb * wb, a.rgba.a * weight_a + b.rgba.a * (1.0 - weight_a));
+    // Alpha uses a sub-linear power mean (p=0.5) instead of a linear mix.
+    // Idempotent for equal inputs — (x,x)->x — so uniformly-translucent
+    // surfaces still blend to their own value, but mixed cases like (1,0)
+    // collapse to 0.25 instead of 0.5. This compresses fine-grid patterns
+    // (an isolated opaque sub-pixel surrounded by empties) toward the
+    // "see-through" perception the eye expects, rather than the
+    // mathematically-correct-but-too-opaque linear average.
+    let alpha = pow(sqrt(a.rgba.a) * weight_a + sqrt(b.rgba.a) * (1.0 - weight_a), 2.0);
+
+    out.rgba = vec4(a.rgba.rgb * wa + b.rgba.rgb * wb, alpha);
     out.roughness = a.roughness * wa + b.roughness * wb;
     out.metallic = a.metallic * wa + b.metallic * wb;
     out.normal = normalize_or_zero(a.normal * wa + b.normal * wb);
