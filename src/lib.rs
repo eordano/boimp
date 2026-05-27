@@ -1,6 +1,7 @@
 pub mod asset_loader;
 pub mod bake;
 pub mod oct_coords;
+pub mod quantize;
 pub mod render;
 
 pub use asset_loader::ImposterLoaderSettings;
