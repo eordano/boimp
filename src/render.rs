@@ -20,6 +20,17 @@ pub const VERTEX_HANDLE: Handle<Shader> = weak_handle!("a3511116-2c4e-4f43-b69a-
 
 pub const RENDER_MULTISAMPLE_FLAG: u32 = 16;
 pub const INDEXED_FLAG: u32 = 32;
+/// V2 indexed format (palette + R8Uint indices). Mutually exclusive with
+/// `INDEXED_FLAG`.
+pub const INDEXED_V2_FLAG: u32 = 64;
+/// Set together with `INDEXED_V2_FLAG` to indicate the idx12 variant —
+/// runtime needs to combine a low-byte and high-nibble texture per pixel.
+/// When unset under v2 we're on idx8 (single texture, low byte only).
+pub const V2_HAS_HIGH_NIBBLE_FLAG: u32 = 128;
+/// Set together with `INDEXED_V2_FLAG` to indicate the idx14 variant —
+/// 14-bit indices stored as low-byte + full high-byte (with 2 unused MSBs).
+/// Mutually exclusive with `V2_HAS_HIGH_NIBBLE_FLAG`.
+pub const V2_HAS_HIGH_BYTE_FLAG: u32 = 256;
 
 pub struct ImposterRenderPlugin;
 
@@ -125,6 +136,12 @@ pub struct Imposter {
     // Res<DummyIndicesImage> gives a default you can drop in
     #[texture(2, dimension = "2d", sample_type = "u_int")]
     pub indices: Handle<Image>,
+    /// V2 idx12 high-nibble texture (R8Uint, half-width). Always bound,
+    /// even on v1 / non-indexed assets — use the `DummyIndicesImage`
+    /// fallback when there's nothing to read. The shader only reads it
+    /// under the `INDEXED_V2_12` shader_def.
+    #[texture(3, dimension = "2d", sample_type = "u_int")]
+    pub indices_hi: Handle<Image>,
     pub alpha_mode: AlphaMode,
     pub vram_bytes: usize,
 }
@@ -178,8 +195,17 @@ impl Material for Imposter {
         frag_defs.push(grid_mode.into());
 
         if (key.bind_group_data.0 & INDEXED_FLAG) != 0 {
-            // indexed
+            // legacy indexed
             frag_defs.push("INDEXED_PIXELS".into());
+        }
+        if (key.bind_group_data.0 & INDEXED_V2_FLAG) != 0 {
+            frag_defs.push("INDEXED_V2".into());
+            if (key.bind_group_data.0 & V2_HAS_HIGH_NIBBLE_FLAG) != 0 {
+                frag_defs.push("INDEXED_V2_12".into());
+            }
+            if (key.bind_group_data.0 & V2_HAS_HIGH_BYTE_FLAG) != 0 {
+                frag_defs.push("INDEXED_V2_14".into());
+            }
         }
 
         Ok(())

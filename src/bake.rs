@@ -447,6 +447,43 @@ impl ImposterBakeCamera {
             }
         }
     }
+
+    /// V2 callback. Same shape as `save_asset_callback`, but produces the
+    /// new on-disk format: shrink + median-cut quantisation into either an
+    /// idx8 (≤256-entry palette, 1 B/pixel) or idx12 (≤4096-entry palette,
+    /// 1.5 B/pixel split-textures) variant. The choice is gated by
+    /// `rgb_rmse_threshold` — a per-imposter quality budget on the
+    /// 256-entry RGB RMSE (0-255 scale; 10 is a good default).
+    pub fn save_asset_callback_v2(
+        &self,
+        path: impl AsRef<Path>,
+        shrink_asset: bool,
+        rgb_rmse_threshold: f32,
+    ) -> impl FnOnce(bevy::prelude::Image) + Send + Sync + 'static {
+        let mut path = path.as_ref().to_owned();
+        if path.extension() != Some(OsStr::new("boimp")) {
+            path.set_extension("boimp");
+        }
+
+        let grid_size = self.grid_size;
+        let tile_size = self.tile_size;
+        let radius = self.radius;
+        let mode = self.grid_mode;
+        move |image| {
+            if let Err(e) = crate::asset_loader::write_asset_v2(
+                &path,
+                radius,
+                grid_size,
+                tile_size,
+                mode,
+                image,
+                shrink_asset,
+                rgb_rmse_threshold,
+            ) {
+                error!("error writing imposter asset (v2): {e}");
+            }
+        }
+    }
 }
 
 #[derive(Component)]
