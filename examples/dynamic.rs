@@ -424,7 +424,7 @@ fn setup_scene_after_load(
             info!("Spawning a directional light");
             commands.spawn((
                 DirectionalLight::default(),
-                Transform::from_xyz(1.0, 1.0, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
+                // Transform::from_xyz(1.0, 1.0, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
                 RenderLayers::default().with(1),
             ));
 
@@ -511,6 +511,7 @@ fn impost(
                     ),
                     pixels: camera.target.clone().unwrap(),
                     indices: dummy_indices.0.clone(),
+                    indices_hi: dummy_indices.0.clone(),
                     alpha_mode: AlphaMode::Blend,
                     vram_bytes: 0,
                 })),

@@ -19,6 +19,9 @@ struct BakeSettings {
     output: String,
     shrink_asset: bool,
     index_asset: bool,
+    /// When `Some`, emit the new v2 on-disk format with this RGB-RMSE
+    /// (0-255 scale) threshold gating the idx8 vs idx12 choice.
+    v2_threshold: Option<f32>,
 }
 
 fn main() {
@@ -110,11 +113,15 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
 
     let shrink_asset = !args.contains("--no-shrink");
     let index_asset = !args.contains("--no-index");
+    // --v2 (default threshold 10), or --threshold <f> to override (implies v2).
+    let explicit_threshold: Option<f32> = args.opt_value_from_str("--threshold").ok().flatten();
+    let v2_flag = args.contains("--v2");
+    let v2_threshold = explicit_threshold.or(if v2_flag { Some(10.0) } else { None });
 
     let unused = args.finish();
     if !unused.is_empty() {
         println!("unrecognized arguments: {unused:?}");
-        println!("args: \n--mode [h]emispherical or [s]pherical\n--grid n (grid size, default 8)\n--tile n (tile size, default 128)\n--multisample-source <n> (average over a larger set of samples, default 8)\n--source path (asset to load, default flight helmet)\n--no-shrink (don't pack the output asset)\n--no-index (don't index the output asset)");
+        println!("args: \n--mode [h]emispherical or [s]pherical\n--grid n (grid size, default 8)\n--tile n (tile size, default 128)\n--multisample-source <n> (average over a larger set of samples, default 8)\n--source path (asset to load, default flight helmet)\n--no-shrink (don't pack the output asset)\n--no-index (don't index the output asset)\n--v2 (write the new on-disk format)\n--threshold <f> (RGB RMSE threshold gating idx8/idx12, implies --v2)");
         std::process::exit(1);
     }
 
@@ -131,6 +138,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         output,
         shrink_asset,
         index_asset,
+        v2_threshold,
     });
 }
 
@@ -261,11 +269,21 @@ fn setup_scene_after_load(
             multisample: settings.multisample,
             ..Default::default()
         };
-        let save_callback = camera.save_asset_callback(
-            &settings.output,
-            settings.shrink_asset,
-            settings.index_asset,
-        );
+        let save_callback: Box<dyn FnOnce(Image) + Send + Sync> =
+            if let Some(threshold) = settings.v2_threshold {
+                info!("using v2 format (RGB RMSE threshold = {threshold})");
+                Box::new(camera.save_asset_callback_v2(
+                    &settings.output,
+                    settings.shrink_asset,
+                    threshold,
+                ))
+            } else {
+                Box::new(camera.save_asset_callback(
+                    &settings.output,
+                    settings.shrink_asset,
+                    settings.index_asset,
+                ))
+            };
 
         let output = settings.output.clone();
         camera.set_callback(move |image| {

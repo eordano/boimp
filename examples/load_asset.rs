@@ -14,6 +14,7 @@ pub fn main() {
         .add_plugins(CameraControllerPlugin)
         .add_systems(Startup, setup)
         .add_systems(Update, set_camera_pos)
+        .insert_resource(AmbientLight{color: Color::WHITE, brightness: 0.5, ..Default::default()})
         .run();
 }
 
@@ -48,7 +49,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, mut meshes: Res
         },
     ));
 
-    commands.spawn(DirectionalLight::default());
+    commands.spawn((DirectionalLight::default(), Transform::default().looking_at(Vec3::new(-1.0, -1.0, -5.0), Vec3::Y)));
 }
 
 fn set_camera_pos(
