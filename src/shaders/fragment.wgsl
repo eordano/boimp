@@ -27,7 +27,7 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
 #ifdef VIEW_PROJECTION_ORTHOGRAPHIC
     let back_vec = direction_view_to_world(vec3<f32>(0.0, 0.0, 1.0));
 #else
-    let back_vec = camera_world_position - in.base_world_position;
+    let back_vec = camera_world_position - in.world_position;
 #endif
 
     // For looking-up views past horizontal, snap to the closest in-grid

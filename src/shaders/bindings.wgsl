@@ -24,6 +24,16 @@ var imposter_pixels: texture_2d<u32>;
 var imposter_indices: texture_2d<u32>;
 #endif
 
+#ifdef INDEXED_V2
+// V2 reuses binding 2 for the (low-byte / single-byte) index texture, and
+// adds binding 3 for the idx12 high-nibble texture. The two #ifdef gates
+// are mutually exclusive — see render.rs `specialize()`.
+@group(2) @binding(2)
+var imposter_indices: texture_2d<u32>;
+@group(2) @binding(3)
+var imposter_indices_hi: texture_2d<u32>;
+#endif
+
 struct SamplePositions {
     tile_indices: array<vec2<u32>, 3>,
     tile_weights: vec3<f32>,
@@ -149,7 +159,13 @@ fn sample_uvs_unbounded(base_world_position: vec3<f32>, world_position: vec3<f32
     let backplane_x = dot(backplane_v, sample_r / (imposter_data.center_and_scale.w * 2.0));
     let backplane_y = dot(backplane_v, sample_u / (imposter_data.center_and_scale.w * 2.0));
 #else
+#ifdef GRID_HEMISPHERICAL
+    // clamp camera position to engage "false orthographic" mode when looking up at a hemisphere
+    let camera_world_position = max(position_view_to_world(vec3<f32>(0.0)), vec3<f32>(-99999.0, world_position.y, -99999.0));
+#else
     let camera_world_position = position_view_to_world(vec3<f32>(0.0));
+#endif
+
     let cam_to_fragment = normalize(world_position - camera_world_position);
     let distance = dot(base_world_position - camera_world_position, basis.normal) / dot(cam_to_fragment, basis.normal);
     let intersect = distance * cam_to_fragment + camera_world_position;
@@ -171,6 +187,8 @@ fn sample_uvs_unbounded(base_world_position: vec3<f32>, world_position: vec3<f32
 }
 
 fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>) -> UnpackedMaterialProps {
+    let oob_mask = vec2<u32>(select(1u, 0u, any(coords < bounds_min) || any(coords >= bounds_max)));
+
 #ifdef INDEXED_PIXELS
     let pixel_dims = textureDimensions(imposter_pixels);
     var index: u32;
@@ -186,11 +204,55 @@ fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>
     let index_x = index % pixel_dims.x;
     let index_y = index / pixel_dims.x;
 
-    let props = textureLoad(imposter_pixels, vec2(index_x, index_y), 0).rg * vec2(select(1u, 0u, any(coords < bounds_min) || any(coords >= bounds_max)));
+    let props = textureLoad(imposter_pixels, vec2(index_x, index_y), 0).rg * oob_mask;
 #else
-    let props = textureLoad(imposter_pixels, vec2<u32>(coords), 0).rg * vec2(select(1u, 0u, any(coords < bounds_min) || any(coords >= bounds_max)));
+#ifdef INDEXED_V2
+    // idx8: index is the byte read from imposter_indices.
+    // idx12 (INDEXED_V2_12 set): also read high nibble from imposter_indices_hi
+    //   — one byte per pair of source pixels, low nibble = even-x pixel,
+    //   high nibble = odd-x pixel. Combine into a 12-bit palette index.
+    // idx14 (INDEXED_V2_14 set): read full high byte from imposter_indices_hi
+    //   (same width as imposter_indices), low 6 bits hold the high 6 bits
+    //   of a 14-bit palette index.
+    let coords_u = vec2<u32>(coords);
+    let pixel_dims = textureDimensions(imposter_pixels);
+    let lo = textureLoad(imposter_indices, coords_u, 0).r;
+#ifdef INDEXED_V2_14
+    let hi_byte = textureLoad(imposter_indices_hi, coords_u, 0).r;
+    let index = lo | ((hi_byte & 0x3Fu) << 8u);
+#else
+#ifdef INDEXED_V2_12
+    let hi_byte = textureLoad(imposter_indices_hi, vec2<u32>(coords_u.x >> 1u, coords_u.y), 0).r;
+    let hi_nibble = (hi_byte >> ((coords_u.x & 1u) * 4u)) & 0xFu;
+    let index = lo | (hi_nibble << 8u);
+#else
+    let index = lo;
+#endif
+#endif
+
+    let index_x = index % pixel_dims.x;
+    let index_y = index / pixel_dims.x;
+
+    let props = textureLoad(imposter_pixels, vec2(index_x, index_y), 0).rg * oob_mask;
+#else
+    let props = textureLoad(imposter_pixels, vec2<u32>(coords), 0).rg * oob_mask;
+#endif
 #endif
     return unpack_props(props);
+}
+
+// Read at `coords` clamped to the tile bounds. Returns whatever's at the
+// nearest in-bounds texel — used for the parallax-anchor read in
+// `sample_tile_material` when the perspective intersection lands outside
+// the tile (close-range views looking past the imposter silhouette). The
+// final material read still uses `single_sample` so genuinely-empty regions
+// continue to discard via alpha-zero.
+fn single_sample_clamped(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>) -> UnpackedMaterialProps {
+    return single_sample(
+        clamp(coords, bounds_min, bounds_max - vec2<f32>(1.0)),
+        bounds_min,
+        bounds_max,
+    );
 }
 
 fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offset: vec2<f32>) -> UnpackedMaterialProps {
@@ -226,12 +288,17 @@ fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offse
 
         return pixel;
 #else
-        let pixel_depth = single_sample(coords_unadjusted, bounds_min, bounds_max);
-        // If the first read landed on a pixel that was never written by the
-        // bake (alpha=0 — outside the silhouette), the unpacked depth defaults
-        // to -1 from the zero storage state, not a real depth. Skip parallax
-        // in that case — multisample is naturally robust here via weighted_props
-        // alpha-weighting, but a single point read isn't.
+        // Anchor read uses clamped coords so close-range views (where the
+        // perspective intersection lands outside the silhouette) still recover
+        // a depth value to shift with. The parallax formula
+        // `depth · (backplane_uv - front_uv)` is mathematically exact for
+        // converting the perspective intersection back to the orthographic UV
+        // when applied with the correct surface depth — the OOB case was the
+        // only thing preventing it from firing. After clamping, the read still
+        // returns alpha=0 if the *clamped* coords are themselves on an empty
+        // texel, in which case we leave coords unshifted and let the final
+        // sample discard naturally.
+        let pixel_depth = single_sample_clamped(coords_unadjusted, bounds_min, bounds_max);
         var coords = coords_unadjusted;
         if pixel_depth.rgba.a > 0.0 {
             coords = coords_unadjusted + pixel_depth.depth * uv_and_dd.zw * vec2<f32>(imposter_data.base_tile_size);
