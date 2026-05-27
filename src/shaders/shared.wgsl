@@ -77,20 +77,57 @@ fn pack_bits(input: f32, offset: u32, count: u32) -> u32 {
 
 fn pack_normal_and_depth(normal: vec3<f32>, depth: f32) -> u32 {
     let octahedral_normal = spherical_uv_from_normal(normal);
-    return 
-        pack_bits(octahedral_normal.x, 0u, 12u) + 
-        pack_bits(octahedral_normal.y, 12u, 12u) +
-        pack_bits(depth, 24u, 8u);
+    // Pre-quantise normals to 4 effective bits per axis (16 levels), even
+    // though we store them in 12-bit slots for layout compatibility. With
+    // 16 levels per axis the median-cut's 1-bucket spread on normals
+    // (~1/15 in normalised space) is coarser than RGB's, matching RGB and
+    // depth's per-bucket cost in the cluster decisions. Stops the high-
+    // frequency normal noise that previously amplified into "firefly"
+    // specular speckle on shiny mip bakes.
+    let nx_q = floor(octahedral_normal.x * 15.0 + 0.5) / 15.0;
+    let ny_q = floor(octahedral_normal.y * 15.0 + 0.5) / 15.0;
+    // Depth pre-quant to 6 bits (64 levels) — keeps parallax precision at
+    // ~1.5% of imposter radius per step, plenty for the half-inter-tile
+    // parallax shifts we actually see, while collapsing sub-step depth
+    // variation that was previously feeding the median-cut as noise.
+    let depth_q = floor(depth * 63.0 + 0.5) / 63.0;
+    return
+        pack_bits(nx_q, 0u, 12u) +
+        pack_bits(ny_q, 12u, 12u) +
+        pack_bits(depth_q, 24u, 8u);
 }
 
 fn pack_rgba_roughness_metallic_flags(albedo: vec4<f32>, roughness: f32, metallic: f32, flags: u32) -> u32 {
-    return 
-        pack_bits(albedo.r, 0u, 5u) +
-        pack_bits(albedo.g, 5u, 5u) +
-        pack_bits(albedo.b, 10u, 5u) +
-        pack_bits(albedo.a, 15u, 5u) +
-        pack_bits(roughness, 20u, 4u) +
-        pack_bits(metallic, 24u, 4u) + 
+    // Pre-quantise all material channels at bake time to collapse "similar
+    // but not identical" pixels onto the *same* pack. The median-cut then
+    // sees them as one weighted point instead of many near-neighbours,
+    // which fights the colour-banding-at-cut-boundary problem at its
+    // source: rather than the cut slicing through a smooth gradient (and
+    // putting adjacent pixels in opposite buckets), the gradient is
+    // pre-discretised into a small number of steps and adjacent pixels
+    // straddling a step share a pack — and thus a palette entry.
+    //
+    // Effective bit budget after pre-quant:
+    //   RGB        4 bits each (16 levels) — primary visual channel
+    //   Alpha      3 bits      (8 levels)  — silhouette steps are visible
+    //   Roughness  2 bits      (4 levels)  — barely-visible at distance
+    //   Metallic   2 bits      (4 levels)  — mostly 0 or 1 in practice
+    //   Flags      stays 4 bits — discrete enum, not averaged
+    //   (normal 5 bits each, depth 6 bits are pre-quantised in
+    //    pack_normal_and_depth below.)
+    let r_q = floor(albedo.r * 15.0 + 0.5) / 15.0;
+    let g_q = floor(albedo.g * 15.0 + 0.5) / 15.0;
+    let b_q = floor(albedo.b * 15.0 + 0.5) / 15.0;
+    let a_q = floor(albedo.a * 7.0 + 0.5) / 7.0;
+    let rough_q = floor(roughness * 3.0 + 0.5) / 3.0;
+    let metal_q = floor(metallic * 3.0 + 0.5) / 3.0;
+    return
+        pack_bits(r_q, 0u, 5u) +
+        pack_bits(g_q, 5u, 5u) +
+        pack_bits(b_q, 10u, 5u) +
+        pack_bits(a_q, 15u, 5u) +
+        pack_bits(rough_q, 20u, 4u) +
+        pack_bits(metal_q, 24u, 4u) +
         (flags << 28u);
 }
 
@@ -143,12 +180,18 @@ fn unpack_rgba(input: u32) -> vec4<f32> {
     );
 }
 
+// roughness and metallic both read back as the raw 4-bit value with no
+// remapping. bevy_pbr clamps `perceptual_roughness` itself before evaluating
+// the GGX microfacet BRDF, so we don't need an extra floor here; the
+// previous `[0.1, 0.9]` double clamp compounded across mips (each higher
+// mip rebakes from the lower mip, applies the clamp on input, and stores
+// it back) and made fully-metallic surfaces never look fully metallic.
 fn unpack_roughness(input: u32) -> f32 {
-    return clamp(unpack_bits(input, 20u, 4u), 0.1, 0.9);
+    return unpack_bits(input, 20u, 4u);
 }
 
 fn unpack_metallic(input: u32) -> f32 {
-    return clamp(unpack_bits(input, 24u, 4u), 0.1, 0.9);
+    return unpack_bits(input, 24u, 4u);
 }
 
 fn unpack_props(packed: vec2<u32>) -> UnpackedMaterialProps {
