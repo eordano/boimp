@@ -36,14 +36,14 @@ fn fragment(in: ImposterVertexOut) {
 
     let samples = sample_positions_from_camera_dir(back * inv_rot);
 
-    let uv_a = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[0]);
-    let uv_b = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[1]);
+    let uv_a = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[0], in.content_half_extent);
+    let uv_b = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[1], in.content_half_extent);
 
     let props_a = sample_tile_material(uv_a, samples.tile_indices[0], vec2(0.0));
     let props_b = sample_tile_material(uv_b, samples.tile_indices[1], vec2(0.0));
 
 #ifndef GRID_HORIZONTAL
-    let uv_c = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[2]);
+    let uv_c = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[2], in.content_half_extent);
     let props_c = sample_tile_material(uv_c, samples.tile_indices[2], vec2(0.0));
 #endif
 
