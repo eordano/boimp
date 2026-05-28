@@ -940,6 +940,156 @@ pub fn quantize_10s(
     }
 }
 
+pub struct QuantResultV3 {
+    /// Up to `k` u32 entries — the same tight 32-bit mat+norm pack as
+    /// `QuantResult10s` (no depth). Slot 0 reserved for alpha=0.
+    pub palette: Vec<u32>,
+    /// One palette index per input pixel (8- or 12-bit range, decided at
+    /// write time from the actual palette size).
+    pub indices: Vec<u16>,
+    /// One direct 4-bit depth level [0, 15] per input pixel. Decoupled from
+    /// the palette and uniform across tiles — depth does not vary with the
+    /// viewing angle. alpha=0 pixels carry 0 (they discard at runtime).
+    pub depths: Vec<u8>,
+    /// Pixel-weighted RGB RMSE (0-255 scale, alpha-weighted).
+    pub rgb_rmse: f32,
+}
+
+/// v3 quantizer: merge distinct pre-quantized mat+norm packs to <= `k`
+/// (reserving slot 0 for alpha=0), keying on mat+norm only. Depth is kept
+/// per-pixel (4-bit, direct) rather than expanded into the palette or a
+/// per-tile depth palette, so the full palette budget goes to colour/normal
+/// and depth is stable under motion.
+///
+/// Reuses the idx10s agglomerative merge by giving every group a uniform
+/// single-bit bitmap: `slot_count() == 1` for all groups, so each merge saves
+/// exactly one slot and the merge reduces to standard Ward-linkage clustering
+/// down to `k - 1` groups.
+pub fn quantize_v3(packs: &[[u8; 8]], k: usize) -> QuantResultV3 {
+    let palette_len = k.max(1);
+
+    if packs.is_empty() || k <= 1 {
+        return QuantResultV3 {
+            palette: vec![0; 1],
+            indices: vec![0; packs.len()],
+            depths: vec![0; packs.len()],
+            rgb_rmse: 0.0,
+        };
+    }
+
+    // Group by exact (mat, norm) — depth byte (hi >> 24) excluded from the key.
+    let mut groups: HashMap<(u32, u32), Group10s> = HashMap::new();
+    for (i, p) in packs.iter().enumerate() {
+        if is_alpha_zero(p) {
+            continue;
+        }
+        let lo = u32::from_le_bytes(p[0..4].try_into().unwrap());
+        let hi = u32::from_le_bytes(p[4..8].try_into().unwrap());
+        let key = (lo, hi & 0x00FF_FFFF);
+
+        let group = groups.entry(key).or_insert_with(|| {
+            // Single-tile, single-bit bitmap → slot_count() == 1 forever.
+            let mut g = Group10s::new(1);
+            g.bitmap[0] = 1;
+            g
+        });
+        if group.count == 0 {
+            let r = (lo & 0x1F) as f32 / 31.0;
+            let g = ((lo >> 5) & 0x1F) as f32 / 31.0;
+            let b = ((lo >> 10) & 0x1F) as f32 / 31.0;
+            let a = ((lo >> 15) & 0x1F) as f32 / 31.0;
+            let rough = ((lo >> 20) & 0xF) as f32 / 15.0;
+            let metal = ((lo >> 24) & 0xF) as f32 / 15.0;
+            let nx = (hi & 0xFFF) as f32 / 4095.0;
+            let ny = ((hi >> 12) & 0xFFF) as f32 / 4095.0;
+            group.centroid = [r, g, b, a, rough, metal, nx, ny];
+            group.flags = lo >> 28;
+        }
+        let alpha_norm = ((lo >> 15) & 0x1F) as f64 / 31.0;
+        group.weight += alpha_norm;
+        group.count += 1;
+        group.pixels.push((i as u32, 0, 0)); // only pixel_index matters for v3
+    }
+
+    let mut groups: Vec<Group10s> = groups.into_values().collect();
+    for g in groups.iter_mut() {
+        g.recompute_slots();
+    }
+    let target = k.saturating_sub(1) as u32; // slot 0 reserved for alpha=0
+    let initial: u32 = groups.iter().map(|g| g.slot_count()).sum();
+    debug!(
+        "quantize_v3: {} groups, target {} (k={})",
+        groups.len(),
+        target,
+        palette_len
+    );
+    if initial > target {
+        agglomerative_merge_10s(&mut groups, target);
+    }
+
+    let mut palette: Vec<u32> = vec![0; palette_len];
+    let mut indices: Vec<u16> = vec![0; packs.len()];
+    let mut next_slot: u32 = 1;
+    for group in &groups {
+        if group.count == 0 {
+            continue;
+        }
+        assert!(
+            (next_slot as usize) < palette_len,
+            "quantize_v3: palette overflow (next={next_slot}, k={palette_len})"
+        );
+        palette[next_slot as usize] = pack_palette_entry_10s(group.centroid, group.flags);
+        for &(pix_idx, _, _) in &group.pixels {
+            indices[pix_idx as usize] = next_slot as u16;
+        }
+        next_slot += 1;
+    }
+    // Trim to the actually-used palette so the caller can pick an 8- vs 12-bit
+    // index from the real entry count (the Vec was sized to the k cap).
+    palette.truncate(next_slot as usize);
+
+    // Per-pixel direct depth: stored 8-bit depth byte → 4-bit level.
+    let mut depths: Vec<u8> = vec![0; packs.len()];
+    for (i, p) in packs.iter().enumerate() {
+        let stored = (u32::from_le_bytes(p[4..8].try_into().unwrap()) >> 24) & 0xFF;
+        depths[i] = ((stored * 15 + 127) / 255) as u8 & 0xF;
+    }
+
+    // RGB RMSE (alpha-weighted, 0-255 scale) — same convention as quantize_10s.
+    let mut rgb_sq_w: f64 = 0.0;
+    let mut total_alpha: f64 = 0.0;
+    for (i, p) in packs.iter().enumerate() {
+        let lo = u32::from_le_bytes(p[0..4].try_into().unwrap());
+        let alpha_bits = (lo >> 15) & 0x1F;
+        if alpha_bits == 0 {
+            continue;
+        }
+        let alpha = alpha_bits as f64 / 31.0;
+        let pal_pack = palette[indices[i] as usize];
+        let pal_r = (pal_pack & 0xF) as f32 * (255.0 / 15.0);
+        let pal_g = ((pal_pack >> 4) & 0xF) as f32 * (255.0 / 15.0);
+        let pal_b = ((pal_pack >> 8) & 0xF) as f32 * (255.0 / 15.0);
+        let pt = unpack_rgb8(*p);
+        let dr = (pt[0] - pal_r) as f64;
+        let dg = (pt[1] - pal_g) as f64;
+        let db = (pt[2] - pal_b) as f64;
+        rgb_sq_w += (dr * dr + dg * dg + db * db) * alpha;
+        total_alpha += alpha;
+    }
+    let rgb_rmse = if total_alpha > 0.0 {
+        (rgb_sq_w / total_alpha).sqrt() as f32
+    } else {
+        0.0
+    };
+
+    QuantResultV3 {
+        palette,
+        indices,
+        depths,
+        rgb_rmse,
+    }
+}
+
 /// Greedy agglomerative merge. Picks the pair maximising `slots_saved / error`
 /// each iteration and merges until total slot count ≤ `target`.
 ///
