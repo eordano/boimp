@@ -21,7 +21,7 @@ use crate::{
     oct_coords::GridMode,
     render::{
         Imposter, ImposterData, INDEXED_FLAG, INDEXED_V2_FLAG, RENDER_MULTISAMPLE_FLAG,
-        V2_HAS_HIGH_BYTE_FLAG, V2_HAS_HIGH_NIBBLE_FLAG, V2_IDX10S_FLAG,
+        V2_HAS_HIGH_BYTE_FLAG, V2_HAS_HIGH_NIBBLE_FLAG, V2_IDX10S_FLAG, V2_V3_FLAG,
     },
 };
 
@@ -346,7 +346,7 @@ fn load_v2(
     reader.set_format(image::ImageFormat::Png);
     reader.no_limits();
     let palette_bytes = reader.decode()?.into_bytes();
-    let (palette_format, palette_byte_size) = if variant == "idx10s" {
+    let (palette_format, palette_byte_size) = if variant == "idx10s" || variant.starts_with("v3") {
         (TextureFormat::R32Uint, 4u32)
     } else {
         (TextureFormat::Rg32Uint, 8u32)
@@ -575,6 +575,92 @@ fn load_v2(
 
             let count = total_size.x * total_size.y + hi_w * total_size.y + dp_width * tile_count;
             (lo, hi, dp, count)
+        }
+        "v3idx8" | "v3idx12" => {
+            variant_flags |= V2_V3_FLAG;
+            let is12 = variant == "v3idx12";
+            if is12 {
+                variant_flags |= V2_HAS_HIGH_NIBBLE_FLAG;
+            }
+
+            // Low/8-bit index plane: idx.png (8-bit) or idx_lo.png (12-bit),
+            // both full-width R8Uint.
+            let lo_name = if is12 { "idx_lo.png" } else { "idx.png" };
+            let raw_lo = BufReader::new(zip.by_name(lo_name)?)
+                .bytes()
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut r_lo = image::ImageReader::new(Cursor::new(raw_lo));
+            r_lo.set_format(image::ImageFormat::Png);
+            r_lo.no_limits();
+            let lo_bytes = r_lo.decode()?.into_bytes();
+            let mut lo_img = Image::new(
+                Extent3d {
+                    width: total_size.x,
+                    height: total_size.y,
+                    depth_or_array_layers: 1,
+                },
+                wgpu::TextureDimension::D2,
+                lo_bytes,
+                TextureFormat::R8Uint,
+                load_settings.asset_usages,
+            );
+            lo_img.transfer_priority = load_settings.transfer_priority;
+            let lo = load_context.add_labeled_asset("idx_lo".to_owned(), lo_img);
+
+            // High nibble (12-bit only): half-width, two 4-bit nibbles per byte.
+            let hi_w = total_size.x.div_ceil(2);
+            let hi = if is12 {
+                let raw_hi = BufReader::new(zip.by_name("idx_hi.png")?)
+                    .bytes()
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut r_hi = image::ImageReader::new(Cursor::new(raw_hi));
+                r_hi.set_format(image::ImageFormat::Png);
+                r_hi.no_limits();
+                let hi_bytes = r_hi.decode()?.into_bytes();
+                let mut hi_img = Image::new(
+                    Extent3d {
+                        width: hi_w,
+                        height: total_size.y,
+                        depth_or_array_layers: 1,
+                    },
+                    wgpu::TextureDimension::D2,
+                    hi_bytes,
+                    TextureFormat::R8Uint,
+                    load_settings.asset_usages,
+                );
+                hi_img.transfer_priority = load_settings.transfer_priority;
+                load_context.add_labeled_asset("idx_hi".to_owned(), hi_img)
+            } else {
+                make_dummy_r8_image(load_context, "v3idx8_dummy_hi")
+            };
+
+            // depth.png — half-width R8Uint, 4-bit per pixel (two per byte).
+            // Bound on the depth-palette slot; the shader reads it per-pixel.
+            let d_w = total_size.x.div_ceil(2);
+            let raw_d = BufReader::new(zip.by_name("depth.png")?)
+                .bytes()
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut r_d = image::ImageReader::new(Cursor::new(raw_d));
+            r_d.set_format(image::ImageFormat::Png);
+            r_d.no_limits();
+            let d_bytes = r_d.decode()?.into_bytes();
+            let mut d_img = Image::new(
+                Extent3d {
+                    width: d_w,
+                    height: total_size.y,
+                    depth_or_array_layers: 1,
+                },
+                wgpu::TextureDimension::D2,
+                d_bytes,
+                TextureFormat::R8Uint,
+                load_settings.asset_usages,
+            );
+            d_img.transfer_priority = load_settings.transfer_priority;
+            let depth = load_context.add_labeled_asset("depth".to_owned(), d_img);
+
+            let hi_count = if is12 { hi_w * total_size.y } else { 0 };
+            let count = total_size.x * total_size.y + hi_count + d_w * total_size.y;
+            (lo, hi, depth, count)
         }
         other => anyhow::bail!("unknown v2 variant `{other}`"),
     };
@@ -980,10 +1066,21 @@ pub fn write_asset_v2(
     //
     // Env override: `BOIMP_V2_NO_IDX10S` falls back to the classic idx8/
     // idx12/idx14 chain — for A/B regression testing only.
-    let allow_10s = std::env::var("BOIMP_V2_NO_IDX10S").is_err();
+    // When idx8 (legacy, mat+norm+depth in 256) isn't accurate enough, emit
+    // the v3 format (mat+norm-only palette to <=4096, decoupled per-pixel
+    // 4-bit depth). `BOIMP_V2_V3_IDX10S` falls back to the old idx10s emit, and
+    // `BOIMP_V2_NO_V3` falls back to the classic idx8/idx12/idx14 chain — both
+    // for A/B testing only. The loader still reads all variants.
+    let allow_v3 = std::env::var("BOIMP_V2_NO_V3").is_err();
     let q256 = crate::quantize::quantize(&packs, 256);
-    if q256.rgb_rmse >= rgb_rmse_threshold && allow_10s {
-        return write_asset_v2_idx10s(
+    if q256.rgb_rmse >= rgb_rmse_threshold && allow_v3 {
+        let emit_idx10s = std::env::var("BOIMP_V2_V3_IDX10S").is_ok();
+        let writer = if emit_idx10s {
+            write_asset_v2_idx10s
+        } else {
+            write_asset_v2_v3
+        };
+        return writer(
             path,
             scale,
             grid_size,
@@ -1289,6 +1386,174 @@ fn write_asset_v2_idx10s(
     zip.finish()?;
     info!(
         "saved imposter v2 (idx10s, palette={palette_count}, RGB RMSE={:.2}) to `{}`",
+        q.rgb_rmse,
+        path.to_string_lossy()
+    );
+    Ok(())
+}
+
+/// Emit the v3 on-disk format: mat+norm-only palette (merged to <=4096),
+/// 8- or 12-bit per-pixel index (chosen by palette size), and a per-pixel
+/// 4-bit *direct* depth plane (no per-tile depth palette — depth is uniform
+/// across viewing angles). See `quantize::quantize_v3`.
+///
+/// File layout in the zip:
+///   - `palette.png`: RGBA8 `palette_x × palette_y` (= R32Uint texels), one
+///     tight 32-bit mat+norm entry per texel.
+///   - 8-bit (`palette <= 256`): `idx.png` Luma8 `total_w × total_h`.
+///   - 12-bit: `idx_lo.png` (bits 0-7, full width) + `idx_hi.png` (bits 8-11,
+///     half-width, two nibbles per byte: low=even-x, high=odd-x).
+///   - `depth.png`: Luma8 `ceil(total_w/2) × total_h`, 4-bit depth per pixel
+///     packed two per byte (low=even-x, high=odd-x).
+#[allow(clippy::too_many_arguments)]
+fn write_asset_v2_v3(
+    path: &PathBuf,
+    scale: f32,
+    grid_size: u32,
+    tile_size: u32,
+    mode: GridMode,
+    packs: &[[u8; 8]],
+    total_w: u32,
+    total_h: u32,
+    packed_offset: UVec2,
+    packed_size: UVec2,
+) -> Result<(), anyhow::Error> {
+    use std::io::Write;
+
+    let q = crate::quantize::quantize_v3(packs, 4096);
+    let palette_count = q.palette.len() as u32;
+    let use_idx8 = palette_count <= 256;
+    let variant = if use_idx8 { "v3idx8" } else { "v3idx12" };
+    let palette_x = ((palette_count as f32).sqrt().ceil() as u32).max(1);
+    let palette_y = palette_count.div_ceil(palette_x).max(1);
+
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let file = std::fs::File::create(path)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+    // palette.png — R32Uint (one u32 mat+norm entry per RGBA8 texel).
+    {
+        let buf_len = (palette_x as usize) * (palette_y as usize) * 4;
+        let mut palette_data = vec![0u8; buf_len];
+        for (i, &entry) in q.palette.iter().enumerate() {
+            palette_data[i * 4..(i + 1) * 4].copy_from_slice(&entry.to_le_bytes());
+        }
+        let dyn_img = DynamicImage::ImageRgba8(
+            ImageBuffer::from_raw(palette_x, palette_y, palette_data)
+                .ok_or_else(|| anyhow!("palette buffer size mismatch"))?,
+        );
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        dyn_img.write_to(&mut cursor, image::ImageFormat::Png)?;
+        zip.start_file("palette.png", options)?;
+        zip.write_all(&cursor.into_inner())?;
+    }
+
+    if use_idx8 {
+        let mut data = vec![0u8; (total_w as usize) * (total_h as usize)];
+        for (i, &idx) in q.indices.iter().enumerate() {
+            data[i] = idx as u8;
+        }
+        let dyn_img = DynamicImage::ImageLuma8(
+            ImageBuffer::from_raw(total_w, total_h, data)
+                .ok_or_else(|| anyhow!("idx buffer size mismatch"))?,
+        );
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        dyn_img.write_to(&mut cursor, image::ImageFormat::Png)?;
+        zip.start_file("idx.png", options)?;
+        zip.write_all(&cursor.into_inner())?;
+    } else {
+        let mut lo_data = vec![0u8; (total_w as usize) * (total_h as usize)];
+        for (i, &idx) in q.indices.iter().enumerate() {
+            lo_data[i] = (idx & 0xFF) as u8;
+        }
+        let dyn_lo = DynamicImage::ImageLuma8(
+            ImageBuffer::from_raw(total_w, total_h, lo_data)
+                .ok_or_else(|| anyhow!("idx_lo buffer size mismatch"))?,
+        );
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        dyn_lo.write_to(&mut cursor, image::ImageFormat::Png)?;
+        zip.start_file("idx_lo.png", options)?;
+        zip.write_all(&cursor.into_inner())?;
+
+        // idx_hi.png — bits 8-11, half-width, two nibbles per byte.
+        let hi_w = total_w.div_ceil(2);
+        let mut hi_data = vec![0u8; (hi_w as usize) * (total_h as usize)];
+        for y in 0..total_h as usize {
+            for xp in 0..hi_w as usize {
+                let xa = xp * 2;
+                let xb = xp * 2 + 1;
+                let a = if xa < total_w as usize {
+                    ((q.indices[y * total_w as usize + xa] >> 8) & 0xF) as u8
+                } else {
+                    0
+                };
+                let b = if xb < total_w as usize {
+                    ((q.indices[y * total_w as usize + xb] >> 8) & 0xF) as u8
+                } else {
+                    0
+                };
+                hi_data[y * hi_w as usize + xp] = a | (b << 4);
+            }
+        }
+        let dyn_hi = DynamicImage::ImageLuma8(
+            ImageBuffer::from_raw(hi_w, total_h, hi_data)
+                .ok_or_else(|| anyhow!("idx_hi buffer size mismatch"))?,
+        );
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        dyn_hi.write_to(&mut cursor, image::ImageFormat::Png)?;
+        zip.start_file("idx_hi.png", options)?;
+        zip.write_all(&cursor.into_inner())?;
+    }
+
+    // depth.png — half-width Luma8, 4-bit depth per pixel, two per byte.
+    {
+        let d_w = total_w.div_ceil(2);
+        let mut d_data = vec![0u8; (d_w as usize) * (total_h as usize)];
+        for y in 0..total_h as usize {
+            for xp in 0..d_w as usize {
+                let xa = xp * 2;
+                let xb = xp * 2 + 1;
+                let a = if xa < total_w as usize {
+                    q.depths[y * total_w as usize + xa] & 0xF
+                } else {
+                    0
+                };
+                let b = if xb < total_w as usize {
+                    q.depths[y * total_w as usize + xb] & 0xF
+                } else {
+                    0
+                };
+                d_data[y * d_w as usize + xp] = a | (b << 4);
+            }
+        }
+        let dyn_d = DynamicImage::ImageLuma8(
+            ImageBuffer::from_raw(d_w, total_h, d_data)
+                .ok_or_else(|| anyhow!("depth buffer size mismatch"))?,
+        );
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        dyn_d.write_to(&mut cursor, image::ImageFormat::Png)?;
+        zip.start_file("depth.png", options)?;
+        zip.write_all(&cursor.into_inner())?;
+    }
+
+    let mode_s = match mode {
+        GridMode::Spherical => "spherical",
+        GridMode::Hemispherical => "hemispherical",
+        GridMode::Horizontal => "Horizontal",
+    };
+    zip.start_file("settings.txt", options)?;
+    zip.write_all(
+        format!(
+            "{grid_size} {scale} {mode_s} {tile_size} {} {} {} {} v2 {variant} {palette_count} {palette_x} {palette_y}",
+            packed_offset.x, packed_offset.y, packed_size.x, packed_size.y
+        )
+        .as_bytes(),
+    )?;
+    zip.finish()?;
+    info!(
+        "saved imposter v2 ({variant}, palette={palette_count}, RGB RMSE={:.2}) to `{}`",
         q.rgb_rmse,
         path.to_string_lossy()
     );

@@ -38,6 +38,13 @@ pub const V2_HAS_HIGH_BYTE_FLAG: u32 = 256;
 /// addressed by `(palette_idx, tile_index_in_grid)`. Mutually exclusive
 /// with `V2_HAS_HIGH_NIBBLE_FLAG` and `V2_HAS_HIGH_BYTE_FLAG`.
 pub const V2_IDX10S_FLAG: u32 = 512;
+/// Set together with `INDEXED_V2_FLAG` to indicate the v3 variant — a
+/// mat+norm-only 32-bit palette (no depth, no merge beyond a 4096 cap) with a
+/// decoupled per-pixel 4-bit *direct* depth plane (reusing the depth-palette
+/// binding as a half-width R8Uint texture). Index is 8-bit by default, or
+/// 12-bit when `V2_HAS_HIGH_NIBBLE_FLAG` is also set. Takes dispatch priority
+/// over the idx10s/idx12/idx14 flags.
+pub const V2_V3_FLAG: u32 = 1024;
 
 pub struct ImposterRenderPlugin;
 
@@ -213,13 +220,19 @@ impl Material for Imposter {
         }
         if (key.bind_group_data.0 & INDEXED_V2_FLAG) != 0 {
             frag_defs.push("INDEXED_V2".into());
-            if (key.bind_group_data.0 & V2_HAS_HIGH_NIBBLE_FLAG) != 0 {
-                frag_defs.push("INDEXED_V2_12".into());
-            }
-            if (key.bind_group_data.0 & V2_IDX10S_FLAG) != 0 {
+            // Mutually-exclusive variant dispatch. v3 takes priority — it reuses
+            // V2_HAS_HIGH_NIBBLE_FLAG to mean "12-bit index" *within* v3, so it
+            // must be checked before the idx12 case.
+            if (key.bind_group_data.0 & V2_V3_FLAG) != 0 {
+                frag_defs.push("INDEXED_V3".into());
+                if (key.bind_group_data.0 & V2_HAS_HIGH_NIBBLE_FLAG) != 0 {
+                    frag_defs.push("INDEXED_V3_12".into());
+                }
+            } else if (key.bind_group_data.0 & V2_IDX10S_FLAG) != 0 {
                 frag_defs.push("INDEXED_V2_10S".into());
-            }
-            if (key.bind_group_data.0 & V2_HAS_HIGH_BYTE_FLAG) != 0 {
+            } else if (key.bind_group_data.0 & V2_HAS_HIGH_NIBBLE_FLAG) != 0 {
+                frag_defs.push("INDEXED_V2_12".into());
+            } else if (key.bind_group_data.0 & V2_HAS_HIGH_BYTE_FLAG) != 0 {
                 frag_defs.push("INDEXED_V2_14".into());
             }
         }

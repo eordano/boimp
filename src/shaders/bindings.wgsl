@@ -258,6 +258,30 @@ fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>
     let coords_u = vec2<u32>(coords);
     let pixel_dims = textureDimensions(imposter_pixels);
     let lo = textureLoad(imposter_indices, coords_u, 0).r;
+#ifdef INDEXED_V3
+    // v3: 8-bit index (lo) or 12-bit (lo + half-width high nibble). Mat+norm
+    // from the R32Uint palette; depth is a per-pixel 4-bit *direct* value read
+    // from the depth plane (half-width, two nibbles per byte, low=even-x) — no
+    // per-tile palette, so depth is stable across viewing angles.
+#ifdef INDEXED_V3_12
+    let hi_byte_v3 = textureLoad(imposter_indices_hi, vec2<u32>(coords_u.x >> 1u, coords_u.y), 0).r;
+    let hi_nib_v3 = (hi_byte_v3 >> ((coords_u.x & 1u) * 4u)) & 0xFu;
+    let index = lo | (hi_nib_v3 << 8u);
+#else
+    let index = lo;
+#endif
+    let index_x = index % pixel_dims.x;
+    let index_y = index / pixel_dims.x;
+    let pack_v3 = textureLoad(imposter_pixels, vec2(index_x, index_y), 0).r * oob_mask.x;
+
+    let d_byte_v3 = textureLoad(imposter_depth_palette, vec2<u32>(coords_u.x >> 1u, coords_u.y), 0).r;
+    let d_nib_v3 = (d_byte_v3 >> ((coords_u.x & 1u) * 4u)) & 0xFu;
+    let depth_f_v3 = f32(d_nib_v3) / 15.0 * 2.0 - 1.0;
+
+    var props = unpack_props_10s(pack_v3);
+    props.depth = depth_f_v3;
+    return props;
+#else
 #ifdef INDEXED_V2_10S
     let hi_byte_10s = textureLoad(imposter_indices_hi, vec2<u32>(coords_u.x >> 2u, coords_u.y), 0).r;
     let hi_bits_10s = (hi_byte_10s >> ((coords_u.x & 3u) * 2u)) & 0x3u;
@@ -297,6 +321,7 @@ fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>
 
     let props = textureLoad(imposter_pixels, vec2(index_x, index_y), 0).rg * oob_mask;
     return unpack_props(props);
+#endif
 #endif
 #else
     let props = textureLoad(imposter_pixels, vec2<u32>(coords), 0).rg * oob_mask;
