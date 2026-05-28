@@ -86,11 +86,16 @@ fn pack_normal_and_depth(normal: vec3<f32>, depth: f32) -> u32 {
     // specular speckle on shiny mip bakes.
     let nx_q = floor(octahedral_normal.x * 15.0 + 0.5) / 15.0;
     let ny_q = floor(octahedral_normal.y * 15.0 + 0.5) / 15.0;
-    // Depth pre-quant to 6 bits (64 levels) — keeps parallax precision at
-    // ~1.5% of imposter radius per step, plenty for the half-inter-tile
-    // parallax shifts we actually see, while collapsing sub-step depth
-    // variation that was previously feeding the median-cut as noise.
-    let depth_q = floor(depth * 63.0 + 0.5) / 63.0;
+    // Depth pre-quant to 4 bits (16 levels). For the idx10s format the
+    // per-tile depth palette holds the *averaged* depth per (tile, slot),
+    // so per-pixel parallax precision is ultimately bounded by what the
+    // palette stores (8 bits) and how many distinct slots a (mat, norm)
+    // earns. Coarser pre-quant collapses near-equal depth pixels into the
+    // same bitmap bucket, reducing per-group slot cost and freeing palette
+    // budget for more distinct (mat, norm). 16 levels = ~6% of imposter
+    // radius per step — visibly coarser than 6-bit but the depth-palette
+    // refinement closes most of the gap.
+    let depth_q = floor(depth * 15.0 + 0.5) / 15.0;
     return
         pack_bits(nx_q, 0u, 12u) +
         pack_bits(ny_q, 12u, 12u) +
@@ -202,6 +207,39 @@ fn unpack_props(packed: vec2<u32>) -> UnpackedMaterialProps {
     props.flags = unpack_flags(packed.r);
     props.normal = unpack_normal(packed.g);
     props.depth = unpack_depth(packed.g);
+    return props;
+}
+
+/// Unpack the tight 32-bit idx10s palette entry.
+///   bits 0-3:   r (4 bits)
+///   bits 4-7:   g
+///   bits 8-11:  b
+///   bits 12-14: alpha (3 bits)
+///   bits 15-16: roughness (2 bits)
+///   bits 17-18: metallic (2 bits)
+///   bits 19-22: flags (4 bits)
+///   bits 23-26: normal_x (4 bits)
+///   bits 27-30: normal_y (4 bits)
+///   bit  31:    unused
+/// Depth is *not* in the palette for idx10s — the caller overrides
+/// `props.depth` after this unpack using a per-tile depth-palette lookup.
+fn unpack_props_10s(pack: u32) -> UnpackedMaterialProps {
+    var props: UnpackedMaterialProps;
+    let r = f32(pack & 0xFu) / 15.0;
+    let g = f32((pack >> 4u) & 0xFu) / 15.0;
+    let b = f32((pack >> 8u) & 0xFu) / 15.0;
+    let a = f32((pack >> 12u) & 0x7u) / 7.0;
+    let rough = f32((pack >> 15u) & 0x3u) / 3.0;
+    let metal = f32((pack >> 17u) & 0x3u) / 3.0;
+    let flags = (pack >> 19u) & 0xFu;
+    let nx = f32((pack >> 23u) & 0xFu) / 15.0;
+    let ny = f32((pack >> 27u) & 0xFu) / 15.0;
+    props.rgba = vec4<f32>(r, g, b, a);
+    props.roughness = rough;
+    props.metallic = metal;
+    props.flags = flags;
+    props.normal = spherical_normal_from_uv(vec2<f32>(nx, ny));
+    props.depth = 0.0;
     return props;
 }
 
