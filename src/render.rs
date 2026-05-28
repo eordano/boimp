@@ -31,6 +31,13 @@ pub const V2_HAS_HIGH_NIBBLE_FLAG: u32 = 128;
 /// 14-bit indices stored as low-byte + full high-byte (with 2 unused MSBs).
 /// Mutually exclusive with `V2_HAS_HIGH_NIBBLE_FLAG`.
 pub const V2_HAS_HIGH_BYTE_FLAG: u32 = 256;
+/// Set together with `INDEXED_V2_FLAG` to indicate the idx10s variant —
+/// 10-bit indices (low-byte + 2 high bits packed 4 pixels per byte in a
+/// quarter-width texture) addressing a tight 32-bit-per-entry palette of
+/// mat+norm (no depth). Depth lives in a separate per-tile palette,
+/// addressed by `(palette_idx, tile_index_in_grid)`. Mutually exclusive
+/// with `V2_HAS_HIGH_NIBBLE_FLAG` and `V2_HAS_HIGH_BYTE_FLAG`.
+pub const V2_IDX10S_FLAG: u32 = 512;
 
 pub struct ImposterRenderPlugin;
 
@@ -142,6 +149,12 @@ pub struct Imposter {
     /// under the `INDEXED_V2_12` shader_def.
     #[texture(3, dimension = "2d", sample_type = "u_int")]
     pub indices_hi: Handle<Image>,
+    /// V2 idx10s per-tile depth palette (R8Uint, `palette_len × tile_count`).
+    /// Always bound — use `DummyIndicesImage` fallback for non-idx10s assets.
+    /// The shader only reads it under the `INDEXED_V2_10S` shader_def,
+    /// looking up `(palette_idx, tile_index_in_grid)`.
+    #[texture(4, dimension = "2d", sample_type = "u_int")]
+    pub depth_palette: Handle<Image>,
     pub alpha_mode: AlphaMode,
     pub vram_bytes: usize,
 }
@@ -202,6 +215,9 @@ impl Material for Imposter {
             frag_defs.push("INDEXED_V2".into());
             if (key.bind_group_data.0 & V2_HAS_HIGH_NIBBLE_FLAG) != 0 {
                 frag_defs.push("INDEXED_V2_12".into());
+            }
+            if (key.bind_group_data.0 & V2_IDX10S_FLAG) != 0 {
+                frag_defs.push("INDEXED_V2_10S".into());
             }
             if (key.bind_group_data.0 & V2_HAS_HIGH_BYTE_FLAG) != 0 {
                 frag_defs.push("INDEXED_V2_14".into());

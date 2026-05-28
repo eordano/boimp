@@ -5,11 +5,12 @@
 }
 
 #import boimp::shared::{
-    ImposterData, 
+    ImposterData,
     UnpackedMaterialProps,
     spherical_normal_from_uv,
-    spherical_uv_from_normal, 
+    spherical_uv_from_normal,
     unpack_props,
+    unpack_props_10s,
     weighted_props,
 };
 
@@ -26,12 +27,17 @@ var imposter_indices: texture_2d<u32>;
 
 #ifdef INDEXED_V2
 // V2 reuses binding 2 for the (low-byte / single-byte) index texture, and
-// adds binding 3 for the idx12 high-nibble texture. The two #ifdef gates
-// are mutually exclusive — see render.rs `specialize()`.
+// adds binding 3 for the idx12 high-nibble texture. idx10s reuses 3 for the
+// quarter-width high-2-bits texture and adds binding 4 for the per-tile
+// depth palette. Bindings are always present (dummy fallback for variants
+// that don't use them) — the shader only reads the relevant ones under
+// matching `INDEXED_V2_12` / `INDEXED_V2_14` / `INDEXED_V2_10S` defs.
 @group(2) @binding(2)
 var imposter_indices: texture_2d<u32>;
 @group(2) @binding(3)
 var imposter_indices_hi: texture_2d<u32>;
+@group(2) @binding(4)
+var imposter_depth_palette: texture_2d<u32>;
 #endif
 
 struct SamplePositions {
@@ -186,7 +192,7 @@ fn sample_uvs_unbounded(base_world_position: vec3<f32>, world_position: vec3<f32
     return vec4<f32>(uv, (backplane_uv - uv));
 }
 
-fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>) -> UnpackedMaterialProps {
+fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>, tile_idx_in_grid: u32) -> UnpackedMaterialProps {
     let oob_mask = vec2<u32>(select(1u, 0u, any(coords < bounds_min) || any(coords >= bounds_max)));
 
 #ifdef INDEXED_PIXELS
@@ -205,6 +211,7 @@ fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>
     let index_y = index / pixel_dims.x;
 
     let props = textureLoad(imposter_pixels, vec2(index_x, index_y), 0).rg * oob_mask;
+    return unpack_props(props);
 #else
 #ifdef INDEXED_V2
     // idx8: index is the byte read from imposter_indices.
@@ -214,9 +221,34 @@ fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>
     // idx14 (INDEXED_V2_14 set): read full high byte from imposter_indices_hi
     //   (same width as imposter_indices), low 6 bits hold the high 6 bits
     //   of a 14-bit palette index.
+    // idx10s (INDEXED_V2_10S set): read 2 high bits from imposter_indices_hi
+    //   packed 4 pixels per byte (quarter-width). Mat+norm comes from the
+    //   palette (R32Uint, tight 32-bit pack — no depth). Depth comes from
+    //   imposter_depth_palette at (index, tile_idx_in_grid).
     let coords_u = vec2<u32>(coords);
     let pixel_dims = textureDimensions(imposter_pixels);
     let lo = textureLoad(imposter_indices, coords_u, 0).r;
+#ifdef INDEXED_V2_10S
+    let hi_byte_10s = textureLoad(imposter_indices_hi, vec2<u32>(coords_u.x >> 2u, coords_u.y), 0).r;
+    let hi_bits_10s = (hi_byte_10s >> ((coords_u.x & 3u) * 2u)) & 0x3u;
+    let index = lo | (hi_bits_10s << 8u);
+
+    let index_x = index % pixel_dims.x;
+    let index_y = index / pixel_dims.x;
+    // Tight 32-bit pack — read u32 (.r of the R32Uint texture).
+    let pack_10s = textureLoad(imposter_pixels, vec2(index_x, index_y), 0).r * oob_mask.x;
+
+    // Per-tile depth lookup: row = tile_idx_in_grid, column = palette
+    // index >> 1 (two 4-bit depths packed per byte; low nibble = even
+    // slot, high nibble = odd slot).
+    let dp_byte = textureLoad(imposter_depth_palette, vec2(index >> 1u, tile_idx_in_grid), 0).r;
+    let dp_nibble = (dp_byte >> ((index & 1u) * 4u)) & 0xFu;
+    let depth_f = f32(dp_nibble) / 15.0 * 2.0 - 1.0;
+
+    var props = unpack_props_10s(pack_10s);
+    props.depth = depth_f;
+    return props;
+#else
 #ifdef INDEXED_V2_14
     let hi_byte = textureLoad(imposter_indices_hi, coords_u, 0).r;
     let index = lo | ((hi_byte & 0x3Fu) << 8u);
@@ -234,11 +266,13 @@ fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>
     let index_y = index / pixel_dims.x;
 
     let props = textureLoad(imposter_pixels, vec2(index_x, index_y), 0).rg * oob_mask;
+    return unpack_props(props);
+#endif
 #else
     let props = textureLoad(imposter_pixels, vec2<u32>(coords), 0).rg * oob_mask;
-#endif
-#endif
     return unpack_props(props);
+#endif
+#endif
 }
 
 // Read at `coords` clamped to the tile bounds. Returns whatever's at the
@@ -247,11 +281,12 @@ fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>
 // the tile (close-range views looking past the imposter silhouette). The
 // final material read still uses `single_sample` so genuinely-empty regions
 // continue to discard via alpha-zero.
-fn single_sample_clamped(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>) -> UnpackedMaterialProps {
+fn single_sample_clamped(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>, tile_idx_in_grid: u32) -> UnpackedMaterialProps {
     return single_sample(
         clamp(coords, bounds_min, bounds_max - vec2<f32>(1.0)),
         bounds_min,
         bounds_max,
+        tile_idx_in_grid,
     );
 }
 
@@ -259,13 +294,15 @@ fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offse
     let bounds_min = vec2<f32>(grid_index * imposter_data.packed_size);
     let bounds_max = bounds_min + vec2<f32>(imposter_data.packed_size);
     let coords_unadjusted = bounds_min - vec2<f32>(imposter_data.packed_offset) + uv_and_dd.xy * vec2<f32>(imposter_data.base_tile_size) + coord_offset;
+    // Linear tile index for the idx10s per-tile depth-palette lookup.
+    let tile_idx = grid_index.y * imposter_data.grid_size + grid_index.x;
 
 #ifdef MATERIAL_MULTISAMPLE
         // multisample for depth
-        let pixel_tl_depth = single_sample(coords_unadjusted, bounds_min, bounds_max);
-        let pixel_tr_depth = single_sample(coords_unadjusted + vec2(1.0, 0.0), bounds_min, bounds_max);
-        let pixel_bl_depth = single_sample(coords_unadjusted + vec2(0.0, 1.0), bounds_min, bounds_max);
-        let pixel_br_depth = single_sample(coords_unadjusted + vec2(1.0, 1.0), bounds_min, bounds_max);
+        let pixel_tl_depth = single_sample(coords_unadjusted, bounds_min, bounds_max, tile_idx);
+        let pixel_tr_depth = single_sample(coords_unadjusted + vec2(1.0, 0.0), bounds_min, bounds_max, tile_idx);
+        let pixel_bl_depth = single_sample(coords_unadjusted + vec2(0.0, 1.0), bounds_min, bounds_max, tile_idx);
+        let pixel_br_depth = single_sample(coords_unadjusted + vec2(1.0, 1.0), bounds_min, bounds_max, tile_idx);
 
         let frac = clamp((fract(coords_unadjusted) - (imposter_data.multisample_amount / 2.0)) / (1.0 - imposter_data.multisample_amount), vec2(0.0), vec2(1.0));
         let pixel_top_depth = weighted_props(pixel_tl_depth, pixel_tr_depth, 1.0 - frac.x);
@@ -276,10 +313,10 @@ fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offse
         let coords = coords_unadjusted + depth * uv_and_dd.zw * vec2<f32>(imposter_data.base_tile_size);
 
         // multisample final material
-        let pixel_tl = single_sample(coords, bounds_min, bounds_max);
-        let pixel_tr = single_sample(coords + vec2(1.0, 0.0), bounds_min, bounds_max);
-        let pixel_bl = single_sample(coords + vec2(0.0, 1.0), bounds_min, bounds_max);
-        let pixel_br = single_sample(coords + vec2(1.0, 1.0), bounds_min, bounds_max);
+        let pixel_tl = single_sample(coords, bounds_min, bounds_max, tile_idx);
+        let pixel_tr = single_sample(coords + vec2(1.0, 0.0), bounds_min, bounds_max, tile_idx);
+        let pixel_bl = single_sample(coords + vec2(0.0, 1.0), bounds_min, bounds_max, tile_idx);
+        let pixel_br = single_sample(coords + vec2(1.0, 1.0), bounds_min, bounds_max, tile_idx);
 
         let frac2 = clamp((fract(coords) - (imposter_data.multisample_amount / 2.0)) / (1.0 - imposter_data.multisample_amount), vec2(0.0), vec2(1.0));
         let pixel_top = weighted_props(pixel_tl, pixel_tr, 1.0 - frac2.x);
@@ -298,12 +335,12 @@ fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offse
         // returns alpha=0 if the *clamped* coords are themselves on an empty
         // texel, in which case we leave coords unshifted and let the final
         // sample discard naturally.
-        let pixel_depth = single_sample_clamped(coords_unadjusted, bounds_min, bounds_max);
+        let pixel_depth = single_sample_clamped(coords_unadjusted, bounds_min, bounds_max, tile_idx);
         var coords = coords_unadjusted;
         if pixel_depth.rgba.a > 0.0 {
             coords = coords_unadjusted + pixel_depth.depth * uv_and_dd.zw * vec2<f32>(imposter_data.base_tile_size);
         }
-        let pixel = single_sample(coords, bounds_min, bounds_max);
+        let pixel = single_sample(coords, bounds_min, bounds_max, tile_idx);
 
         return pixel;
 #endif
