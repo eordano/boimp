@@ -28,6 +28,10 @@ struct ImposterVertexOut {
     @location(2) inverse_rotation_0c: vec3<f32>,
     @location(3) inverse_rotation_1c: vec3<f32>,
     @location(4) inverse_rotation_2c: vec3<f32>,
+    // World-space half-extents of the render mesh (= content bounding box when
+    // the caller sizes the mesh to the baked content). Used to bound look-up
+    // parallax to the content's actual extent rather than the tile footprint.
+    @location(5) content_half_extent: vec3<f32>,
 }
 
 struct UnpackedMaterialProps {

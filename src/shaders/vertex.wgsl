@@ -35,6 +35,13 @@ fn vertex(vertex: Vertex) -> ImposterVertexOut {
     out.inverse_rotation_1c = inv_rot[1];
     out.inverse_rotation_2c = inv_rot[2];
     out.base_world_position = imposter_world_position;
+    // Half-extents of the render mesh in world units (column lengths of the
+    // model matrix scale the unit-cube half-extent of 0.5).
+    out.content_half_extent = 0.5 * vec3<f32>(
+        length(model[0].xyz),
+        length(model[1].xyz),
+        length(model[2].xyz),
+    );
 
     let back = direction_view_to_world(vec3<f32>(0.0, 0.0, 1.0));
     out.world_position = mesh_functions::mesh_position_local_to_world(model, vec4<f32>(vertex.position, 1.0)).xyz;

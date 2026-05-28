@@ -148,7 +148,7 @@ fn oct_mode_normal_from_uv(grid_index: vec2<u32>, inv_rot: mat3x3<f32>) -> Basis
 }
 
 // uv at mid, impact of 1 depth on uv
-fn sample_uvs_unbounded(base_world_position: vec3<f32>, world_position: vec3<f32>, inv_rot: mat3x3<f32>, grid_index: vec2<u32>) -> vec4<f32> {
+fn sample_uvs_unbounded(base_world_position: vec3<f32>, world_position: vec3<f32>, inv_rot: mat3x3<f32>, grid_index: vec2<u32>, content_half_extent: vec3<f32>) -> vec4<f32> {
     let basis = oct_mode_normal_from_uv(grid_index, inv_rot);
     let sample_r_vec = cross(basis.normal, -basis.up);
     let sample_u_vec = cross(sample_r_vec, basis.normal);
@@ -165,17 +165,15 @@ fn sample_uvs_unbounded(base_world_position: vec3<f32>, world_position: vec3<f32
     let backplane_x = dot(backplane_v, sample_r / (imposter_data.center_and_scale.w * 2.0));
     let backplane_y = dot(backplane_v, sample_u / (imposter_data.center_and_scale.w * 2.0));
 #else
-#ifdef GRID_HEMISPHERICAL
-    // clamp camera position to engage "false orthographic" mode when looking up at a hemisphere
-    let camera_world_position = max(position_view_to_world(vec3<f32>(0.0)), vec3<f32>(-99999.0, world_position.y, -99999.0));
-#else
+    // Use the real camera throughout — the actual perspective parallax is
+    // correct; the "false orthographic" flat-camera clamp was the source of the
+    // look-up stretch. The only failure mode is reading off the content, which
+    // the content clamp below handles.
     let camera_world_position = position_view_to_world(vec3<f32>(0.0));
-#endif
 
     let cam_to_fragment = normalize(world_position - camera_world_position);
     let distance = dot(base_world_position - camera_world_position, basis.normal) / dot(cam_to_fragment, basis.normal);
     let intersect = distance * cam_to_fragment + camera_world_position;
-    // calculate uv using basis of the sample plane
     let v = intersect - base_world_position;
     let x = dot(v, sample_r / (imposter_data.center_and_scale.w * 2.0));
     let y = dot(v, sample_u / (imposter_data.center_and_scale.w * 2.0));
@@ -189,7 +187,39 @@ fn sample_uvs_unbounded(base_world_position: vec3<f32>, world_position: vec3<f32
 
     let uv = vec2<f32>(x, y) + 0.5;
     let backplane_uv = vec2<f32>(backplane_x, backplane_y) + 0.5;
-    return vec4<f32>(uv, (backplane_uv - uv));
+
+    let h_u = dot(content_half_extent, abs(sample_u));
+    let content_half_v = h_u / (imposter_data.center_and_scale.w * 2.0);
+    let content_v_min = clamp(0.5 - content_half_v, 0.0, 1.0);
+    let content_v_max = clamp(0.5 + content_half_v, 0.0, 1.0);
+
+    var uv_y = uv.y;
+    var ddv = backplane_uv.y - uv.y;
+#ifndef VIEW_PROJECTION_ORTHOGRAPHIC
+    // The far plane (depth -1, away from camera: uv.y - ddv) projects to the top
+    // on look-up and can read past the content. Rather than clamp the depth
+    // impact, gradually flatten the view toward orthographic — moving the
+    // effective camera to the fragment's height — which removes the perspective
+    // curvature *and* brings the read back onto content. The flat/ortho read is
+    // the fragment's own orthographic v (always on the box, since the fragment
+    // sits on it) with zero depth impact; blend the base v and the depth impact
+    // toward those by just enough to put the far-plane sample on the nearest
+    // content edge. t = 0 (real camera) in the interior, -> 1 (orthographic) at
+    // the box edge, so the flattening is local and the stretch never returns.
+    let ortho_v = dot(world_position - base_world_position, sample_u / (imposter_data.center_and_scale.w * 2.0)) + 0.5;
+    let far_v = uv_y - ddv;
+    var t = 0.0;
+    if far_v < content_v_min {
+        t = (content_v_min - far_v) / (ortho_v - far_v);
+    } else if far_v > content_v_max {
+        t = (content_v_max - far_v) / (ortho_v - far_v);
+    }
+    t = clamp(t, 0.0, 1.0);
+    uv_y = mix(uv_y, ortho_v, t);
+    ddv = mix(ddv, 0.0, t);
+#endif
+
+    return vec4<f32>(vec2<f32>(uv.x, uv_y), vec2<f32>(backplane_uv.x - uv.x, ddv));
 }
 
 fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>, tile_idx_in_grid: u32) -> UnpackedMaterialProps {
