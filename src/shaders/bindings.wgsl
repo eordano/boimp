@@ -214,30 +214,28 @@ fn sample_uvs_unbounded(base_world_position: vec3<f32>, world_position: vec3<f32
     out.initial_depth = 0.0;
 
 #ifndef VIEW_PROJECTION_ORTHOGRAPHIC
-    // Always pull the anchor toward the fragment side of the ray — even when
-    // mid_uv looks like it's in content. A hard "if mid OOB → adjust" trigger
-    // produces a visible horizontal seam exactly where mid_uv crosses the
-    // content boundary, because the per-fragment content can be tighter than
-    // `content_half_extent` and the read at the boundary returns α=0.
+    // Anchor the sample halfway between the fragment and where the perspective
+    // ray exits content's V band, clamped to lie between the fragment and the
+    // midplane so we never go past either endpoint. This smooths the
+    // discontinuity at mid_uv == content_v_max — the previous "if mid OOB"
+    // branch produced a visible horizontal seam there.
     //
-    // Compute the depth at which the ray exits content going from the fragment
-    // toward (and possibly past) the midplane, then anchor halfway between the
-    // fragment and that exit. Clamp the chosen depth to lie between the
-    // fragment and the midplane so we never go past either endpoint — for
-    // fragments where mid is deep in content, the clamp collapses to the
-    // midplane and we recover the original behaviour.
+    // Only `content_v_max` is honoured: the bake's content aabb is clipped
+    // from below (we discard points below y=1 so very flat scenes stay
+    // floor-only), so `content_v_min` is artificially raised and the actual
+    // texture often holds content below it. Treating that bogus floor as a
+    // real boundary mis-anchors look-down fragments. `content_v_max`, by
+    // contrast, is genuine — nothing is clipped from above — so we use that
+    // as the boundary and let the clamp handle the look-down direction (where
+    // d_use collapses to `fragment_depth` and the anchor lands at the
+    // fragment's own UV).
     let h_u = dot(content_half_extent, abs(sample_u));
     let content_half_v = h_u / (imposter_data.center_and_scale.w * 2.0);
-    let content_v_min = clamp(0.5 - content_half_v, 0.0, 1.0);
     let content_v_max = clamp(0.5 + content_half_v, 0.0, 1.0);
 
     let fragment_depth = dot(world_position - base_world_position, basis.normal) / imposter_data.center_and_scale.w;
-    let fragment_v = dot(world_position - base_world_position, sample_u / (imposter_data.center_and_scale.w * 2.0)) + 0.5;
-    // V changes monotonically with d, so the boundary the ray hits going from
-    // fragment toward (and past) mid is the one in the direction v is moving.
-    let target_v = select(content_v_min, content_v_max, mid_uv.y > fragment_v);
     let denom = select(dduddv.y, sign(dduddv.y) * 1e-6 + 1e-12, abs(dduddv.y) < 1e-6);
-    let d_exit = (target_v - mid_uv.y) / denom;
+    let d_exit = (content_v_max - mid_uv.y) / denom;
     let d_use_raw = (fragment_depth + d_exit) * 0.5;
     let d_use = clamp(d_use_raw, min(fragment_depth, 0.0), max(fragment_depth, 0.0));
 
