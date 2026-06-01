@@ -147,79 +147,105 @@ fn oct_mode_normal_from_uv(grid_index: vec2<u32>, inv_rot: mat3x3<f32>) -> Basis
     return basis;
 }
 
-// uv at mid, impact of 1 depth on uv
-fn sample_uvs_unbounded(base_world_position: vec3<f32>, world_position: vec3<f32>, inv_rot: mat3x3<f32>, grid_index: vec2<u32>, content_half_extent: vec3<f32>) -> vec4<f32> {
+// Initial UV/depth + perspective slope for one sample of an imposter tile.
+//   initial_uv    - texture UV at which to read the depth-and-material data
+//   initial_depth - depth (relative to mid plane; +1 = near, -1 = far) that
+//                   initial_uv corresponds to. The consumer must subtract this
+//                   from the texture-read depth before applying dduddv.
+//   dduddv        - shift in UV per +1 unit of depth (toward the near plane).
+struct UVSample {
+    initial_uv: vec2<f32>,
+    initial_depth: f32,
+    dduddv: vec2<f32>,
+}
+
+// Returns the anchor UV at which to read the depth/material texture, the depth
+// of that anchor, and the per-unit-depth perspective slope (`dduddv`). For the
+// common case where the perspective ray's mid-plane projection lands inside the
+// content's V range, the anchor is just that mid-plane UV at depth 0.
+//
+// For look-up views the mid-plane projection can land *above* the content
+// silhouette (empty texture). Rather than smear, anchor at a depth between the
+// fragment and the depth at which the perspective ray leaves the content
+// bounds — specifically the midpoint of those two depths — so the depth read
+// lands inside the content where there's real data to drive the parallax.
+fn sample_uvs_unbounded(base_world_position: vec3<f32>, world_position: vec3<f32>, inv_rot: mat3x3<f32>, grid_index: vec2<u32>, content_half_extent: vec3<f32>) -> UVSample {
     let basis = oct_mode_normal_from_uv(grid_index, inv_rot);
     let sample_r_vec = cross(basis.normal, -basis.up);
     let sample_u_vec = cross(sample_r_vec, basis.normal);
     let sample_r = normalize(sample_r_vec);
     let sample_u = normalize(sample_u_vec);
-    let backplane_base_world_position = base_world_position + basis.normal * imposter_data.center_and_scale.w;
+    // `+basis.normal` points from the imposter toward the bake camera, so the
+    // plane at `base + n * scale` is the *near* plane (depth +1), not the back.
+    let near_base_world_position = base_world_position + basis.normal * imposter_data.center_and_scale.w;
 
 #ifdef VIEW_PROJECTION_ORTHOGRAPHIC
     let v = world_position - base_world_position;
     let x = dot(v, sample_r / (imposter_data.center_and_scale.w * 2.0));
     let y = dot(v, sample_u / (imposter_data.center_and_scale.w * 2.0));
 
-    let backplane_v = world_position - backplane_base_world_position;
-    let backplane_x = dot(backplane_v, sample_r / (imposter_data.center_and_scale.w * 2.0));
-    let backplane_y = dot(backplane_v, sample_u / (imposter_data.center_and_scale.w * 2.0));
+    let near_v = world_position - near_base_world_position;
+    let near_x = dot(near_v, sample_r / (imposter_data.center_and_scale.w * 2.0));
+    let near_y = dot(near_v, sample_u / (imposter_data.center_and_scale.w * 2.0));
 #else
-    // Use the real camera throughout — the actual perspective parallax is
-    // correct; the "false orthographic" flat-camera clamp was the source of the
-    // look-up stretch. The only failure mode is reading off the content, which
-    // the content clamp below handles.
     let camera_world_position = position_view_to_world(vec3<f32>(0.0));
-
     let cam_to_fragment = normalize(world_position - camera_world_position);
+
     let distance = dot(base_world_position - camera_world_position, basis.normal) / dot(cam_to_fragment, basis.normal);
     let intersect = distance * cam_to_fragment + camera_world_position;
     let v = intersect - base_world_position;
     let x = dot(v, sample_r / (imposter_data.center_and_scale.w * 2.0));
     let y = dot(v, sample_u / (imposter_data.center_and_scale.w * 2.0));
 
-    let backplane_distance = dot(backplane_base_world_position - camera_world_position, basis.normal) / dot(cam_to_fragment, basis.normal);
-    let backplane_intersect = backplane_distance * cam_to_fragment + camera_world_position;
-    let backplane_v = backplane_intersect - backplane_base_world_position;
-    let backplane_x = dot(backplane_v, sample_r / (imposter_data.center_and_scale.w * 2.0));
-    let backplane_y = dot(backplane_v, sample_u / (imposter_data.center_and_scale.w * 2.0));
+    let near_distance = dot(near_base_world_position - camera_world_position, basis.normal) / dot(cam_to_fragment, basis.normal);
+    let near_intersect = near_distance * cam_to_fragment + camera_world_position;
+    let near_v = near_intersect - near_base_world_position;
+    let near_x = dot(near_v, sample_r / (imposter_data.center_and_scale.w * 2.0));
+    let near_y = dot(near_v, sample_u / (imposter_data.center_and_scale.w * 2.0));
 #endif
 
-    let uv = vec2<f32>(x, y) + 0.5;
-    let backplane_uv = vec2<f32>(backplane_x, backplane_y) + 0.5;
+    let mid_uv = vec2<f32>(x, y) + 0.5;
+    let near_uv = vec2<f32>(near_x, near_y) + 0.5;
+    let dduddv = near_uv - mid_uv;
 
+    var out: UVSample;
+    out.dduddv = dduddv;
+    out.initial_uv = mid_uv;
+    out.initial_depth = 0.0;
+
+#ifndef VIEW_PROJECTION_ORTHOGRAPHIC
+    // Always pull the anchor toward the fragment side of the ray — even when
+    // mid_uv looks like it's in content. A hard "if mid OOB → adjust" trigger
+    // produces a visible horizontal seam exactly where mid_uv crosses the
+    // content boundary, because the per-fragment content can be tighter than
+    // `content_half_extent` and the read at the boundary returns α=0.
+    //
+    // Compute the depth at which the ray exits content going from the fragment
+    // toward (and possibly past) the midplane, then anchor halfway between the
+    // fragment and that exit. Clamp the chosen depth to lie between the
+    // fragment and the midplane so we never go past either endpoint — for
+    // fragments where mid is deep in content, the clamp collapses to the
+    // midplane and we recover the original behaviour.
     let h_u = dot(content_half_extent, abs(sample_u));
     let content_half_v = h_u / (imposter_data.center_and_scale.w * 2.0);
     let content_v_min = clamp(0.5 - content_half_v, 0.0, 1.0);
     let content_v_max = clamp(0.5 + content_half_v, 0.0, 1.0);
 
-    var uv_y = uv.y;
-    var ddv = backplane_uv.y - uv.y;
-#ifndef VIEW_PROJECTION_ORTHOGRAPHIC
-    // The far plane (depth -1, away from camera: uv.y - ddv) projects to the top
-    // on look-up and can read past the content. Rather than clamp the depth
-    // impact, gradually flatten the view toward orthographic — moving the
-    // effective camera to the fragment's height — which removes the perspective
-    // curvature *and* brings the read back onto content. The flat/ortho read is
-    // the fragment's own orthographic v (always on the box, since the fragment
-    // sits on it) with zero depth impact; blend the base v and the depth impact
-    // toward those by just enough to put the far-plane sample on the nearest
-    // content edge. t = 0 (real camera) in the interior, -> 1 (orthographic) at
-    // the box edge, so the flattening is local and the stretch never returns.
-    let ortho_v = dot(world_position - base_world_position, sample_u / (imposter_data.center_and_scale.w * 2.0)) + 0.5;
-    let far_v = uv_y - ddv;
-    var t = 0.0;
-    if far_v < content_v_min {
-        t = (content_v_min - far_v) / (ortho_v - far_v);
-    } else if far_v > content_v_max {
-        t = (content_v_max - far_v) / (ortho_v - far_v);
-    }
-    t = clamp(t, 0.0, 1.0);
-    uv_y = mix(uv_y, ortho_v, t);
-    ddv = mix(ddv, 0.0, t);
+    let fragment_depth = dot(world_position - base_world_position, basis.normal) / imposter_data.center_and_scale.w;
+    let fragment_v = dot(world_position - base_world_position, sample_u / (imposter_data.center_and_scale.w * 2.0)) + 0.5;
+    // V changes monotonically with d, so the boundary the ray hits going from
+    // fragment toward (and past) mid is the one in the direction v is moving.
+    let target_v = select(content_v_min, content_v_max, mid_uv.y > fragment_v);
+    let denom = select(dduddv.y, sign(dduddv.y) * 1e-6 + 1e-12, abs(dduddv.y) < 1e-6);
+    let d_exit = (target_v - mid_uv.y) / denom;
+    let d_use_raw = (fragment_depth + d_exit) * 0.5;
+    let d_use = clamp(d_use_raw, min(fragment_depth, 0.0), max(fragment_depth, 0.0));
+
+    out.initial_uv = mid_uv + d_use * dduddv;
+    out.initial_depth = d_use;
 #endif
 
-    return vec4<f32>(vec2<f32>(uv.x, uv_y), vec2<f32>(backplane_uv.x - uv.x, ddv));
+    return out;
 }
 
 fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>, tile_idx_in_grid: u32) -> UnpackedMaterialProps {
@@ -345,12 +371,17 @@ fn single_sample_clamped(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: v
     );
 }
 
-fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offset: vec2<f32>) -> UnpackedMaterialProps {
+fn sample_tile_material(sample: UVSample, grid_index: vec2<u32>, coord_offset: vec2<f32>) -> UnpackedMaterialProps {
     let bounds_min = vec2<f32>(grid_index * imposter_data.packed_size);
     let bounds_max = bounds_min + vec2<f32>(imposter_data.packed_size);
-    let coords_unadjusted = bounds_min - vec2<f32>(imposter_data.packed_offset) + uv_and_dd.xy * vec2<f32>(imposter_data.base_tile_size) + coord_offset;
+    let coords_unadjusted = bounds_min - vec2<f32>(imposter_data.packed_offset) + sample.initial_uv * vec2<f32>(imposter_data.base_tile_size) + coord_offset;
     // Linear tile index for the idx10s per-tile depth-palette lookup.
     let tile_idx = grid_index.y * imposter_data.grid_size + grid_index.x;
+
+    // The texture's `depth` field is the surface depth relative to the mid
+    // plane. When the anchor UV is itself at `initial_depth != 0`, the
+    // perspective shift from the anchor to the surface uses the *delta*.
+    let depth_shift = sample.dduddv * vec2<f32>(imposter_data.base_tile_size);
 
 #ifdef MATERIAL_MULTISAMPLE
         // multisample for depth
@@ -365,7 +396,7 @@ fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offse
         let pixel_depth = weighted_props(pixel_top_depth, pixel_bottom_depth, 1.0 - frac.y);
         let depth = pixel_depth.depth;
 
-        let coords = coords_unadjusted + depth * uv_and_dd.zw * vec2<f32>(imposter_data.base_tile_size);
+        let coords = coords_unadjusted + (depth - sample.initial_depth) * depth_shift;
 
         // multisample final material
         let pixel_tl = single_sample(coords, bounds_min, bounds_max, tile_idx);
@@ -382,18 +413,15 @@ fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offse
 #else
         // Anchor read uses clamped coords so close-range views (where the
         // perspective intersection lands outside the silhouette) still recover
-        // a depth value to shift with. The parallax formula
-        // `depth · (backplane_uv - front_uv)` is mathematically exact for
-        // converting the perspective intersection back to the orthographic UV
-        // when applied with the correct surface depth — the OOB case was the
-        // only thing preventing it from firing. After clamping, the read still
+        // a depth value to shift with. The OOB case was the only thing
+        // preventing the read from firing. After clamping, the read still
         // returns alpha=0 if the *clamped* coords are themselves on an empty
         // texel, in which case we leave coords unshifted and let the final
         // sample discard naturally.
         let pixel_depth = single_sample_clamped(coords_unadjusted, bounds_min, bounds_max, tile_idx);
         var coords = coords_unadjusted;
         if pixel_depth.rgba.a > 0.0 {
-            coords = coords_unadjusted + pixel_depth.depth * uv_and_dd.zw * vec2<f32>(imposter_data.base_tile_size);
+            coords = coords_unadjusted + (pixel_depth.depth - sample.initial_depth) * depth_shift;
         }
         let pixel = single_sample(coords, bounds_min, bounds_max, tile_idx);
 
