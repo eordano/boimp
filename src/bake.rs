@@ -32,8 +32,7 @@ use bevy::{
     camera::{
         primitives::{Aabb, Sphere},
         visibility::{
-            NoFrustumCulling, PreviousVisibleEntities, RenderLayers, VisibilitySystems,
-            VisibleEntities,
+            NoFrustumCulling, RenderLayers, SetViewVisibility, VisibilitySystems, VisibleEntities,
         },
         CameraOutputMode, CameraProjection, ScalingMode,
     },
@@ -53,7 +52,8 @@ use bevy::{
         },
         render_resource::{
             binding_types::{storage_buffer, storage_buffer_read_only, uniform_buffer},
-            BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries, Buffer,
+            BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutDescriptor,
+            BindGroupLayoutEntries, Buffer,
             BufferDescriptor, CachedRenderPipelineId, ColorTargetState, ColorWrites,
             CommandEncoderDescriptor, Extent3d, FragmentState, PipelineCache, RenderPassDescriptor,
             RenderPipelineDescriptor, ShaderType, SpecializedMeshPipeline,
@@ -67,7 +67,7 @@ use bevy::{
             ColorGrading, ExtractedView, NoIndirectDrawing, RenderVisibleEntities,
             RetainedViewEntity, ViewDepthTexture, ViewUniformOffset,
         },
-        Extract, Render, RenderApp, RenderDebugFlags, RenderSet, RenderStartup,
+        Extract, Render, RenderApp, RenderDebugFlags, RenderStartup, RenderSystems,
     },
     // bevy 0.17 moved shader types out of bevy_render into bevy_shader (facade: `bevy::shader`).
     shader::{ShaderDefVal, ShaderRef},
@@ -160,17 +160,17 @@ impl Plugin for ImposterBakePlugin {
             .add_systems(
                 Render,
                 (
-                    prepare_imposter_textures.in_set(RenderSet::PrepareResources),
-                    prepare_imposter_bindgroups.in_set(RenderSet::PrepareBindGroups),
+                    prepare_imposter_textures.in_set(RenderSystems::PrepareResources),
+                    prepare_imposter_bindgroups.in_set(RenderSystems::PrepareBindGroups),
                     copy_preprocess_bindgroups
-                        .in_set(RenderSet::PrepareBindGroups)
+                        .in_set(RenderSystems::PrepareBindGroups)
                         .after(prepare_preprocess_bind_groups),
                 ),
             )
             .add_systems(
                 Render,
                 copy_back
-                    .in_set(RenderSet::Cleanup)
+                    .in_set(RenderSystems::Cleanup)
                     .before(World::clear_entities),
             )
             .add_render_sub_graph(ImposterBakeGraph)
@@ -226,8 +226,13 @@ impl Plugin for ImposterBakePlugin {
 /// Apple Silicon does not expose rg32uint read-write storage textures.
 /// A storage buffer of `vec2<u32>` works around the limitation without
 /// losing precision.
+/// bevy 0.18: `RenderPipelineDescriptor::layout` now holds
+/// [`BindGroupLayoutDescriptor`]s (resolved lazily by the pipeline cache)
+/// rather than concrete [`BindGroupLayout`]s. We still need a concrete
+/// `BindGroupLayout` to build the bake bind group at prepare time, so we hold
+/// both: `.0` for `create_bind_group`, `.1` for the pipeline descriptor.
 #[derive(Resource)]
-pub struct BakeStorageBindGroupLayout(pub BindGroupLayout);
+pub struct BakeStorageBindGroupLayout(pub BindGroupLayout, pub BindGroupLayoutDescriptor);
 
 #[derive(ShaderType, Clone, Copy)]
 pub struct BakeDims {
@@ -237,18 +242,18 @@ pub struct BakeDims {
 impl FromWorld for BakeStorageBindGroupLayout {
     fn from_world(world: &mut World) -> Self {
         let device = world.resource::<RenderDevice>();
-        let layout = device.create_bind_group_layout(
-            "imposter_bake_storage_layout",
-            &BindGroupLayoutEntries::sequential(
-                ShaderStages::FRAGMENT,
-                (
-                    // runtime array of `vec2<u32>` — element size 8 bytes
-                    storage_buffer::<Vec<UVec2>>(false),
-                    uniform_buffer::<BakeDims>(false),
-                ),
+        let entries = BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                // runtime array of `vec2<u32>` — element size 8 bytes
+                storage_buffer::<Vec<UVec2>>(false),
+                uniform_buffer::<BakeDims>(false),
             ),
         );
-        Self(layout)
+        let label = "imposter_bake_storage_layout";
+        let layout = device.create_bind_group_layout(label, &entries);
+        let descriptor = BindGroupLayoutDescriptor::new(label, &entries);
+        Self(layout, descriptor)
     }
 }
 
@@ -319,7 +324,7 @@ where
             .add_systems(
                 Render,
                 queue_imposter_material_meshes::<M>
-                    .in_set(RenderSet::QueueMeshes)
+                    .in_set(RenderSystems::QueueMeshes)
                     .after(prepare_erased_assets::<MeshMaterial3d<M>>),
             );
     }
@@ -579,7 +584,6 @@ pub fn check_imposter_visibility(
         ),
         With<Mesh3d>,
     >,
-    mut previous_visible_entities: ResMut<PreviousVisibleEntities>,
 ) {
     for (
         _view,
@@ -638,17 +642,18 @@ pub fn check_imposter_visibility(
                         }
                     }
                 }
-                if !**view_visibility {
-                    view_visibility.set();
-                }
+                // bevy 0.18: ViewVisibility is bit-packed (current/previous frame).
+                // `set_visible()` triggers change detection only on a hidden->visible
+                // transition; the old `**view_visibility` deref + `set()` is gone.
+                view_visibility.set_visible();
                 queue.push(entity);
             },
         );
 
         thread_queues.drain_into(visible_entities.get_mut(TypeId::of::<Mesh3d>()));
-        for entity in visible_entities.get(TypeId::of::<Mesh3d>()) {
-            previous_visible_entities.remove(entity);
-        }
+        // bevy 0.18: previous-frame visibility tracking moved into ViewVisibility's
+        // bit-packing (handled by `reset_view_visibility`), so the explicit
+        // `PreviousVisibleEntities` bookkeeping that lived here is gone.
         expected_count.0 = 0;
     }
 }
@@ -940,6 +945,8 @@ pub fn extract_imposter_cameras(
                         camera.tile_size * camera.grid_size,
                     ),
                     color_grading: ColorGrading::default(),
+                    // bevy 0.18: new ExtractedView field (mirror-plane culling flip).
+                    invert_culling: false,
                 };
 
                 let id = commands
@@ -972,7 +979,8 @@ pub fn extract_imposter_cameras(
                 render_graph: ImposterBakeGraph.intern(),
                 order: camera.order,
                 output_mode: CameraOutputMode::Skip,
-                msaa_writeback: false,
+                // bevy 0.18: msaa_writeback is now an enum (was bool). `false` -> Off.
+                msaa_writeback: MsaaWriteback::Off,
                 clear_color: ClearColorConfig::None,
                 sorted_camera_index_for_target: 0,
                 exposure: 0.0,
@@ -989,6 +997,7 @@ pub fn extract_imposter_cameras(
                 hdr: false,
                 viewport: UVec4::new(0, 0, 1, 1),
                 color_grading: ColorGrading::default(),
+                invert_culling: false,
             },
             ViewUniformOffset { offset: u32::MAX },
             NoIndirectDrawing,
@@ -1034,7 +1043,9 @@ fn copy_preprocess_bindgroups(
 pub struct ImposterBakePipeline<M: ImposterBakeMaterial> {
     prepass_pipeline: PrepassPipeline,
     frag_shader: Handle<Shader>,
-    storage_layout: BindGroupLayout,
+    // bevy 0.18: pipeline descriptor layouts are descriptors, not concrete
+    // `BindGroupLayout`s.
+    storage_layout: BindGroupLayoutDescriptor,
     _p: PhantomData<fn() -> M>,
 }
 
@@ -1056,7 +1067,7 @@ pub fn init_imposter_bake_pipeline<M: ImposterBakeMaterial>(
     commands.insert_resource(ImposterBakePipeline::<M> {
         prepass_pipeline: prepass_pipeline.clone(),
         frag_shader,
-        storage_layout: storage_layout.0.clone(),
+        storage_layout: storage_layout.1.clone(),
         _p: PhantomData,
     });
 }
@@ -1070,7 +1081,9 @@ pub fn init_imposter_bake_pipeline<M: ImposterBakeMaterial>(
 pub struct ImposterBakePipelineSpecializer<M: ImposterBakeMaterial> {
     prepass: PrepassPipelineSpecializer,
     frag_shader: Handle<Shader>,
-    storage_layout: BindGroupLayout,
+    // bevy 0.18: pushed into `descriptor.layout`, which is now a
+    // `Vec<BindGroupLayoutDescriptor>`.
+    storage_layout: BindGroupLayoutDescriptor,
     _p: PhantomData<fn() -> M>,
 }
 
@@ -1198,21 +1211,22 @@ impl FromWorld for ImposterBlitPipeline {
         let device = world.resource::<RenderDevice>();
         let pipeline_cache = world.resource::<PipelineCache>();
 
-        let layout = device.create_bind_group_layout(
-            "imposter_blit_layout",
-            &BindGroupLayoutEntries::sequential(
-                ShaderStages::FRAGMENT,
-                (
-                    storage_buffer_read_only::<Vec<UVec2>>(false),
-                    uniform_buffer::<BakeDims>(false),
-                    uniform_buffer::<BlitUniform>(false),
-                ),
+        let entries = BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                storage_buffer_read_only::<Vec<UVec2>>(false),
+                uniform_buffer::<BakeDims>(false),
+                uniform_buffer::<BlitUniform>(false),
             ),
         );
+        // bevy 0.18: keep a concrete layout for `create_bind_group` and a
+        // descriptor for the pipeline's `layout` field.
+        let layout = device.create_bind_group_layout("imposter_blit_layout", &entries);
+        let layout_descriptor = BindGroupLayoutDescriptor::new("imposter_blit_layout", &entries);
 
         let pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
             label: Some("imposter_blit_render_pipeline".into()),
-            layout: vec![layout.clone()],
+            layout: vec![layout_descriptor],
             vertex,
             fragment: Some(FragmentState {
                 shader: IMPOSTER_BLIT_HANDLE,

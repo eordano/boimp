@@ -10,7 +10,7 @@ use bevy::{
     asset::{AssetLoader, Handle, RenderAssetTransferPriority},
     log::{debug, info},
     math::{UVec2, Vec3},
-    prelude::{AlphaMode, Image},
+    prelude::{AlphaMode, Image, TypePath},
     render::render_asset::RenderAssetUsages,
 };
 use image::{DynamicImage, ImageBuffer};
@@ -25,6 +25,8 @@ use crate::{
     },
 };
 
+// bevy 0.18: AssetLoader now requires TypePath.
+#[derive(TypePath)]
 pub struct ImposterLoader;
 
 #[derive(Serialize, Deserialize)]
