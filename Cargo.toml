@@ -5,14 +5,17 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-bevy = { version = "0.18", default-features=false, features = [
+bevy = { version = "0.19", default-features=false, features = [
     "bevy_core_pipeline",
     "bevy_render",
     "bevy_pbr",
     "bevy_log",
     "bevy_asset"
 ] }
-wgpu = "27"
+wgpu = "29"
+# bevy 0.19: SortedPhaseItem::recalculate_sort_keys takes an `indexmap::IndexMap`
+# directly (no bevy re-export), so we depend on the same major version bevy uses.
+indexmap = "2"
 crossbeam-channel = "*"
 async-channel = "*"
 image = "*"
@@ -27,10 +30,10 @@ serde = { version = "1", features = ["derive"] }
 [dev-dependencies]
 pico-args = "0.5.0"
 rand = "0.8.5"
-bevy = { version = "0.18", default-features = true }
+bevy = { version = "0.19", default-features = true }
 
-# Build against the local DCL bevy fork (release-0.18-dcl). boimp relies on
+# Build against the local DCL bevy fork (release-0.19-dcl). boimp relies on
 # DCL-fork-only APIs (e.g. RenderAssetTransferPriority / Image::transfer_priority)
-# that are not present in upstream crates.io bevy 0.18.
+# that are not present in upstream crates.io bevy 0.19.
 [patch.crates-io]
 bevy = { path = "/home/dcl/bevy-fork" }

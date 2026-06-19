@@ -1,3 +1,147 @@
+# boimp: Bevy 0.18 → 0.19 port notes
+
+Branch: `0.19` (off `0.18`).
+Target: DCL bevy fork at `/home/dcl/bevy-fork`, branch `release-0.19-dcl`
+(resolves **wgpu 29.0.3**).
+
+**Status:** the **library builds clean** against the fork
+(`dcl-shell -c "cargo build"`). Several `examples/` do *not* build — they depend
+on bevy subsystems that 0.19 reworked outside the scope of the imposter port
+(scene spawning, ambient light, messages); see "Examples (not ported)" below.
+
+## Cargo.toml
+- `bevy` `0.18` → `0.19` (lib dep + dev-dep).
+- `wgpu` `27` → `29` (must match the fork's wgpu 29.0.3, else `TextureFormat` /
+  `Extent3d` / `RenderPassDescriptor` type mismatches).
+- Added `indexmap = "2"` — `SortedPhaseItem::recalculate_sort_keys` (new in 0.19)
+  takes an `indexmap::IndexMap` directly and bevy doesn't re-export it.
+
+## The big one: render-graph node → ECS system (`src/bake.rs`)
+Bevy 0.19 replaced the node-based render graph with **schedules of ECS systems**.
+
+- **`ImposterBakeGraph`** was a `#[derive(RenderSubGraph)]`; it is now a
+  `#[derive(ScheduleLabel)]`. `CameraRenderGraph::new(ImposterBakeGraph)` still
+  works because `CameraRenderGraph` now wraps an interned `ScheduleLabel`, and
+  the **camera driver** runs that schedule per bake camera, setting the
+  `CurrentView` resource to the camera's render entity.
+- **Registration** (`ImposterBakePlugin::build`): the old
+  `add_render_sub_graph` + `add_render_graph_node::<…>` (bake node + the two GPU
+  preprocess nodes) + `add_render_graph_edges` chain was replaced by:
+  ```rust
+  render_app
+      .add_schedule(Schedule::new(ImposterBakeGraph))
+      .add_systems(
+          ImposterBakeGraph,
+          (early_gpu_preprocess, late_gpu_preprocess, imposter_bake_pass).chain(),
+      );
+  ```
+  `NodePbr::{Early,Late}GpuPreprocess` graph nodes (`EarlyGpuPreprocessNode` /
+  `LateGpuPreprocessNode`) are gone; bevy now exposes `early_gpu_preprocess` /
+  `late_gpu_preprocess` as `pub` systems (re-exported via `bevy::pbr`). They run
+  against the `CurrentView` (the bake camera, which has `ExtractedView` +
+  `ViewUniformOffset` + `NoIndirectDrawing` and no `SkipGpuPreprocess`), so they
+  still generate the mesh uniforms the bake pass needs — preserving the old
+  `EarlyGpuPreprocess -> LateGpuPreprocess -> ImposterBakeNode` ordering.
+- **`ImposterBakeNode` (impl `ViewNode`) → `imposter_bake_pass` system.** The
+  `impl ViewNode { fn run(_graph, render_context, (camera, textures), world) }`
+  became a plain system:
+  ```rust
+  pub fn imposter_bake_pass(
+      world: &World,                       // for RenderPhase::render
+      view: ViewQuery<(&ExtractedImposterBakeCamera, &ImposterResources)>,
+      … Res params …,
+      mut ctx: RenderContext,              // SystemParam, replaces &mut RenderContext
+  )
+  ```
+  - `&World` as the first param is the idiom bevy's own `main_opaque_pass_3d`
+    uses — it's needed because `RenderPhase::render(&mut pass, world, view)`
+    requires full world access to dispatch draw functions.
+  - The node `ViewQuery` (component tuple) became the `ViewQuery<…>` **system
+    param** (`bevy::render::renderer::ViewQuery`), which fetches the components
+    of the `CurrentView` entity.
+  - The old `render_context.add_command_buffer_generation_task(move |device| {
+    … command_encoder.finish() })` closure (which built a `CommandBuffer` off the
+    main thread) was inlined into the system body recording directly onto
+    `ctx.command_encoder()`. `RenderContext` auto-flushes the encoder at the end
+    of each render system, so no explicit `.finish()`/return is needed. The
+    `@group(4)` bake-storage bind group, per-tile bake+blit passes, depth reuse,
+    and the readback `copy_texture_to_buffer` path are all unchanged.
+  - In-task `world.resource::<RenderDevice>()` / `world.resource::<ImpostersBaked>()`
+    became ordinary `Res` system params.
+
+## Per-frame batching / phase API churn (`queue_imposter_material_meshes`, etc.)
+0.19 reworked mesh batching and phase keys; these are independent of the render
+graph change:
+- `ErasedMaterialPipelineKey` / `ErasedMeshPipelineKey` moved to the extracted
+  `bevy_material` crate — import from `bevy::material::key::…` (no longer
+  re-exported by `bevy::pbr`). `ErasedMaterialPipelineKey::mesh_key` is now an
+  **erased** `ErasedMeshPipelineKey`, not a concrete `MeshPipelineKey`:
+  build with `ErasedMeshPipelineKey::new(mesh_key)`, read back with
+  `key.mesh_key.downcast::<MeshPipelineKey>()` (used both in the bake
+  specializer's `MAY_DISCARD` union and when constructing the queue key).
+- **`RenderVisibleEntities`** restructured: `.entities: TypeIdMap<Vec<…>>` →
+  `.classes: TypeIdMap<RenderVisibleEntitiesClass>` (separate
+  `entities_cpu_culling` / `entities_gpu_culling` lists + per-frame
+  added/removed diffs). `extract_imposter_cameras` now builds the class map
+  (populating `entities_cpu_culling` only — the bake camera CPU-culls
+  everything), and `queue_imposter_material_meshes` reads
+  `visible_entities.get::<Mesh3d>()?.entities_cpu_culling` instead of the
+  removed `iter::<Mesh3d>()`.
+- `RenderMeshQueueData::mesh_asset_id` is now a **method** (`mesh_asset_id()`).
+- `MeshAllocator::mesh_slabs` returns `Option<MeshSlabs>` (struct with
+  `vertex_slab_id` / `index_slab_id`) instead of a `(vertex, index)` tuple;
+  `Opaque3dBatchSetKey` / `OpaqueNoLightmap3dBatchSetKey` now carry the whole
+  `slabs: MeshSlabs` (their `vertex_slab` / `index_slab` fields are gone).
+- Binned `RenderPhase::add(…)` no longer takes a trailing change `Tick`.
+- Sorted phases: `ViewSortedRenderPhases::insert_or_clear` →
+  `prepare_for_new_frame`; items are added with `add_retained` (the bare `add`
+  is gone). `Transparent3d` gained `sorting_info: TransparentSortingInfo3d` —
+  bake tiles use `AlwaysOnTop` (they're rendered unsorted at fixed distance 0.0).
+
+## Smaller API changes
+- `SortedPhaseItem` gained a required `recalculate_sort_keys(items, view)`
+  method. `ImposterPhaseItem<T>`'s impl is a no-op (bake tiles aren't depth
+  sorted).
+- `ExtractedView`: `hdr: bool` → `target_format: TextureFormat` (set to
+  `Rg32Uint`, the bake output format).
+- `ExtractedCamera`: `render_graph` field renamed to `schedule`
+  (`InternedScheduleLabel`); new `compositing_space: Option<CompositingSpace>`
+  field (`None`).
+- `RenderPipelineDescriptor` (now in `bevy_material`, still re-exported via
+  `render_resource`): `push_constant_ranges: Vec<…>` → `immediate_size: u32`
+  (blit pipeline uses `immediate_size: 0`).
+- `wgpu::RenderPassDescriptor` gained a `multiview_mask: Option<…>` field
+  (both bake and blit passes set `None`).
+- `PrepassPipelineSpecializer` (fork-`pub` `pipeline` + `properties` fields):
+  signature unchanged — the bake specializer still constructs it directly.
+
+## Fork dependencies (unchanged from prior ports)
+boimp still relies on DCL-fork-only APIs:
+- `PrepassPipelineSpecializer.{pipeline,properties}` made `pub` for out-of-crate
+  reuse (instead of copy-pasting bevy's prepass specialization into boimp).
+- `RenderAssetTransferPriority` / `Image::transfer_priority` (used elsewhere in
+  the renderer integration).
+No new fork API gaps were hit during the 0.18 → 0.19 port.
+
+## Examples (not ported)
+`examples/{save_asset,dynamic,load_asset,custom_mesh}.rs` +
+`examples/helpers/camera_controller.rs` fail to build under 0.19 due to
+subsystem reworks unrelated to imposter baking:
+- **Scene spawning rewrite:** `bevy::scene::{InstanceId, SceneSpawner}` were
+  removed (bevy_scene was rewritten around `scene_patch` / `resolved_scene` /
+  `spawn_system`). The GLTF-load + per-instance readiness polling in
+  `save_asset` / `dynamic` needs a full rewrite against the new scene API.
+- `AmbientLight` is no longer a `Resource` (now a component) — `insert_resource`
+  calls fail.
+- `DirectionalLight::shadows_enabled` field removed.
+- `EventReader` → `MessageReader` (events became messages); the camera
+  controller's `EventReader<MouseMotion/MouseWheel>` params and
+  `run_camera_controller` system no longer type-check.
+Porting these is a separate task (no imposter-render code involved); the library
+that downstreams consume builds clean.
+
+---
+
 # boimp: Bevy 0.16 → 0.17 port notes
 
 Branch: `0.17` (off `feat/composite-bake-via-storage-texture`).

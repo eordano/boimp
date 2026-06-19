@@ -15,16 +15,20 @@ use bevy::{
         prepass::{OpaqueNoLightmap3dBatchSetKey, OpaqueNoLightmap3dBinKey},
         FullscreenShader,
     },
-    ecs::system::lifetimeless::SRes,
+    ecs::{schedule::ScheduleLabel, system::lifetimeless::SRes},
     image::{ImageSampler, TextureFormatPixelInfo},
     pbr::{
-        alpha_mode_pipeline_key, graph::NodePbr, prepare_preprocess_bind_groups, DrawMesh,
-        EarlyGpuPreprocessNode, ErasedMaterialPipelineKey, ExtendedMaterial, LateGpuPreprocessNode,
-        MaterialBindGroupAllocators, MaterialExtension, MeshPipeline,
-        MeshPipelineKey, PreparedMaterial, PrepassPipeline, PrepassPipelineSpecializer,
-        PreprocessBindGroups, RenderMaterialInstances, RenderMeshInstances, SetMaterialBindGroup,
-        SetMeshBindGroup, SetPrepassViewBindGroup, SetPrepassViewEmptyBindGroup, SkipGpuPreprocess,
+        alpha_mode_pipeline_key, early_gpu_preprocess, late_gpu_preprocess,
+        prepare_preprocess_bind_groups, DrawMesh, ExtendedMaterial, MaterialBindGroupAllocators,
+        MaterialExtension, MeshPipeline, MeshPipelineKey, PreparedMaterial, PrepassPipeline,
+        PrepassPipelineSpecializer, PreprocessBindGroups, RenderMaterialInstances,
+        RenderMeshInstances, SetMaterialBindGroup, SetMeshBindGroup, SetPrepassViewBindGroup,
+        SetPrepassViewEmptyBindGroup, SkipGpuPreprocess,
     },
+    // bevy 0.19: ErasedMaterialPipelineKey / ErasedMeshPipelineKey moved into the
+    // extracted `bevy_material` crate (facade: `bevy::material`); no longer
+    // re-exported by bevy_pbr. The material key's `mesh_key` is now erased.
+    material::key::{ErasedMaterialPipelineKey, ErasedMeshPipelineKey},
     platform::collections::{HashMap, HashSet},
     prelude::*,
     // bevy 0.17 split bevy_render: camera/projection/visibility/primitives types
@@ -42,7 +46,6 @@ use bevy::{
         erased_render_asset::{prepare_erased_assets, ErasedRenderAssets},
         mesh::{allocator::MeshAllocator, RenderMesh},
         render_asset::{RenderAssetUsages, RenderAssets},
-        render_graph::{RenderGraphExt, RenderLabel, RenderSubGraph, ViewNode, ViewNodeRunner},
         render_phase::{
             AddRenderCommand, BinnedPhaseItem, BinnedRenderPhasePlugin, BinnedRenderPhaseType,
             CachedRenderPipelinePhaseItem, DrawFunctionId, DrawFunctions, PhaseItem,
@@ -55,12 +58,17 @@ use bevy::{
             BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutDescriptor,
             BindGroupLayoutEntries, Buffer,
             BufferDescriptor, CachedRenderPipelineId, ColorTargetState, ColorWrites,
-            CommandEncoderDescriptor, Extent3d, FragmentState, PipelineCache, RenderPassDescriptor,
+            Extent3d, FragmentState, PipelineCache, RenderPassDescriptor,
             RenderPipelineDescriptor, ShaderType, SpecializedMeshPipeline,
             SpecializedMeshPipelines, StoreOp, Texture, TextureDescriptor, TextureDimension,
             TextureFormat, TextureUsages, UniformBuffer,
         },
-        renderer::{RenderDevice, RenderQueue},
+        // bevy 0.19: the render graph is now a `Schedule` of ECS systems. Per-camera
+        // sub-graphs are their own schedules run by the camera driver (which sets
+        // the `CurrentView` resource, read via the `ViewQuery` system param).
+        // `RenderContext` is a SystemParam that records GPU commands (auto-flushed
+        // at the end of each render system).
+        renderer::{RenderContext, RenderDevice, RenderQueue},
         sync_world::{MainEntity, RenderEntity, SyncToRenderWorld},
         texture::{CachedTexture, GpuImage, TextureCache},
         view::{
@@ -84,7 +92,10 @@ use crate::{
 
 pub struct ImposterBakePlugin;
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderSubGraph)]
+// bevy 0.19: per-camera render graphs are `Schedule`s, not `RenderSubGraph`s.
+// `ImposterBakeGraph` is now a `ScheduleLabel`; the camera driver runs this
+// schedule for the bake camera (setting `CurrentView` to the camera entity).
+#[derive(Debug, Hash, PartialEq, Eq, Clone, ScheduleLabel)]
 pub struct ImposterBakeGraph;
 
 pub const STANDARD_BAKE_HANDLE: Handle<Shader> =
@@ -173,26 +184,16 @@ impl Plugin for ImposterBakePlugin {
                     .in_set(RenderSystems::Cleanup)
                     .before(World::clear_entities),
             )
-            .add_render_sub_graph(ImposterBakeGraph)
-            .add_render_graph_node::<ViewNodeRunner<ImposterBakeNode>>(
+            // bevy 0.19: register the bake camera's render graph as a `Schedule`.
+            // The camera driver runs it (setting `CurrentView` to the bake camera)
+            // because the camera carries `CameraRenderGraph::new(ImposterBakeGraph)`.
+            // The old graph nodes become chained systems: GPU mesh preprocessing
+            // (early/late, reusing bevy's own systems — they operate on the
+            // `CurrentView`, i.e. the bake camera) followed by the bake pass.
+            .add_schedule(Schedule::new(ImposterBakeGraph))
+            .add_systems(
                 ImposterBakeGraph,
-                ImposterBakeNode,
-            )
-            .add_render_graph_node::<EarlyGpuPreprocessNode>(
-                ImposterBakeGraph,
-                NodePbr::EarlyGpuPreprocess,
-            )
-            .add_render_graph_node::<LateGpuPreprocessNode>(
-                ImposterBakeGraph,
-                NodePbr::LateGpuPreprocess,
-            )
-            .add_render_graph_edges(
-                ImposterBakeGraph,
-                (
-                    NodePbr::EarlyGpuPreprocess,
-                    NodePbr::LateGpuPreprocess,
-                    ImposterBakeNode,
-                ),
+                (early_gpu_preprocess, late_gpu_preprocess, imposter_bake_pass).chain(),
             );
 
         app.add_plugins(ImposterBakeMaterialPlugin::<StandardMaterial>::default());
@@ -715,6 +716,21 @@ impl<T: SortedPhaseItem> SortedPhaseItem for ImposterPhaseItem<T> {
         self.inner.sort_key()
     }
 
+    // bevy 0.19: new required trait method (the renderer calls it before `sort`
+    // to populate any view-dependent sort keys, e.g. distance). Imposter bake
+    // tiles are rendered in arbitrary order with a fixed distance of 0.0 (see
+    // `queue_imposter_material_meshes`), so there is nothing to recalculate.
+    #[inline]
+    fn recalculate_sort_keys(
+        _items: &mut indexmap::IndexMap<
+            (Entity, MainEntity),
+            Self,
+            bevy::ecs::entity::EntityHash,
+        >,
+        _view: &ExtractedView,
+    ) {
+    }
+
     #[inline]
     fn indexed(&self) -> bool {
         self.inner.indexed()
@@ -875,7 +891,8 @@ pub fn extract_imposter_cameras(
             retained_view_entity,
             GpuPreprocessingMode::PreprocessingOnly,
         );
-        transparent.insert_or_clear(retained_view_entity);
+        // bevy 0.19: `insert_or_clear` -> `prepare_for_new_frame` for sorted phases.
+        transparent.prepare_for_new_frame(retained_view_entity);
         entities.insert(retained_view_entity);
 
         let center = gt.translation();
@@ -890,12 +907,18 @@ pub fn extract_imposter_cameras(
         };
         projection.update(0.0, 0.0);
 
+        // bevy 0.19: `RenderVisibleEntities` was restructured. `.entities`
+        // (a `TypeIdMap<Vec<(Entity, MainEntity)>>`) became
+        // `.classes: TypeIdMap<RenderVisibleEntitiesClass>`, splitting CPU- and
+        // GPU-culled entities (plus per-frame added/removed diffs). The bake
+        // camera CPU-culls everything in `check_imposter_visibility`, so we
+        // populate `entities_cpu_culling` only; our custom queue reads that list.
         let render_visible_entities = RenderVisibleEntities {
-            entities: visible_entities
+            classes: visible_entities
                 .entities
                 .iter()
                 .map(|(type_id, entities)| {
-                    let entities = entities
+                    let entities_cpu_culling = entities
                         .iter()
                         .map(|entity| {
                             let render_entity = mapper
@@ -906,7 +929,13 @@ pub fn extract_imposter_cameras(
                             (render_entity, (*entity).into())
                         })
                         .collect();
-                    (*type_id, entities)
+                    (
+                        *type_id,
+                        bevy::render::view::RenderVisibleEntitiesClass {
+                            entities_cpu_culling,
+                            ..Default::default()
+                        },
+                    )
                 })
                 .collect(),
         };
@@ -937,7 +966,10 @@ pub fn extract_imposter_cameras(
                     clip_from_view,
                     world_from_view: camera_transform,
                     clip_from_world: None,
-                    hdr: false,
+                    // bevy 0.19: `hdr: bool` replaced by `target_format`. The bake
+                    // pass writes to the Rg32Uint storage buffer (no colour target),
+                    // so the view's nominal target format is the Rg32Uint output.
+                    target_format: TextureFormat::Rg32Uint,
                     viewport: UVec4::new(
                         0,
                         0,
@@ -976,7 +1008,9 @@ pub fn extract_imposter_cameras(
                 physical_viewport_size: Some(UVec2::splat(camera.tile_size * camera.grid_size)),
                 physical_target_size: Some(UVec2::splat(camera.tile_size * camera.grid_size)),
                 viewport: None,
-                render_graph: ImposterBakeGraph.intern(),
+                // bevy 0.19: `render_graph` field renamed to `schedule` and now
+                // holds an interned `ScheduleLabel` (the camera driver runs it).
+                schedule: ImposterBakeGraph.intern(),
                 order: camera.order,
                 output_mode: CameraOutputMode::Skip,
                 // bevy 0.18: msaa_writeback is now an enum (was bool). `false` -> Off.
@@ -985,6 +1019,8 @@ pub fn extract_imposter_cameras(
                 sorted_camera_index_for_target: 0,
                 exposure: 0.0,
                 hdr: false,
+                // bevy 0.19: new field for sRGB vs linear compositing space.
+                compositing_space: None,
             },
             render_visible_entities,
             // we must add this to get the gpu mesh uniform system to pick up the view and generate mesh uniforms for us
@@ -994,7 +1030,8 @@ pub fn extract_imposter_cameras(
                 clip_from_view,
                 world_from_view: GlobalTransform::IDENTITY,
                 clip_from_world: None,
-                hdr: false,
+                // bevy 0.19: `hdr: bool` -> `target_format`.
+                target_format: TextureFormat::Rg32Uint,
                 viewport: UVec4::new(0, 0, 1, 1),
                 color_grading: ColorGrading::default(),
                 invert_culling: false,
@@ -1104,9 +1141,14 @@ where
         // pretty similar to a prepass, so let's start there.
         // would be glorious if this was abstracted so we could avoid cheating like this, or copy/pasting 250 lines
 
-        // add MAY_DISCARD to force fragment shader
+        // add MAY_DISCARD to force fragment shader.
+        // bevy 0.19: `ErasedMaterialPipelineKey::mesh_key` is now an erased
+        // `ErasedMeshPipelineKey`, not a concrete `MeshPipelineKey`. Downcast to
+        // the typed key, union our flag, then re-erase.
         let key = ErasedMaterialPipelineKey {
-            mesh_key: key.mesh_key.union(MeshPipelineKey::MAY_DISCARD),
+            mesh_key: ErasedMeshPipelineKey::new(
+                key.mesh_key.downcast::<MeshPipelineKey>() | MeshPipelineKey::MAY_DISCARD,
+            ),
             material_key: key.material_key,
             type_id: key.type_id,
         };
@@ -1239,7 +1281,9 @@ impl FromWorld for ImposterBlitPipeline {
                 })],
             }),
             depth_stencil: None,
-            push_constant_ranges: Default::default(),
+            // bevy 0.19: `push_constant_ranges: Vec<PushConstantRange>` replaced by
+            // `immediate_size: u32` (immediate/push-constant byte size). None used.
+            immediate_size: 0,
             primitive: Default::default(),
             multisample: Default::default(),
             zero_initialize_workgroup_memory: false,
@@ -1453,7 +1497,14 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
 
         let view_key = MeshPipelineKey::from_msaa_samples(1);
 
-        for (render_entity, visible_entity) in visible_entities.iter::<Mesh3d>() {
+        // bevy 0.19: `RenderVisibleEntities::iter::<Mesh3d>()` was removed.
+        // Fetch the per-class entity list and iterate the CPU-culled entities
+        // (the only list the bake camera populates — see `extract_imposter_cameras`).
+        let Some(visible_mesh_entities) = visible_entities.get::<Mesh3d>() else {
+            continue;
+        };
+
+        for (render_entity, visible_entity) in &visible_mesh_entities.entities_cpu_culling {
             let Some(material_instance) = render_material_instances.instances.get(visible_entity)
             else {
                 continue;
@@ -1462,7 +1513,8 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
             else {
                 continue;
             };
-            let Some(mesh) = render_meshes.get(mesh_instance.mesh_asset_id) else {
+            // bevy 0.19: `mesh_asset_id` is now a method on `RenderMeshQueueData`.
+            let Some(mesh) = render_meshes.get(mesh_instance.mesh_asset_id()) else {
                 continue;
             };
             // Skip materials that aren't our concrete type, then look them up
@@ -1502,8 +1554,9 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
             // bevy 0.17: build the erased material pipeline key (carries the
             // material's bind_group_data via `material_key`) and a per-material
             // prepass specializer wrapped by our bake specializer.
+            // bevy 0.19: `ErasedMaterialPipelineKey::mesh_key` is erased.
             let erased_key = ErasedMaterialPipelineKey {
-                mesh_key,
+                mesh_key: ErasedMeshPipelineKey::new(mesh_key),
                 material_key: material.properties.material_key.clone(),
                 type_id: our_type_id,
             };
@@ -1530,7 +1583,13 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
                 }
             };
 
-            let (vertex_slab, index_slab) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id);
+            // bevy 0.19: `mesh_slabs` returns `Option<MeshSlabs>` (a struct with
+            // `vertex_slab_id` / `index_slab_id`) instead of a `(vertex, index)`
+            // tuple. Batch-set keys now carry the whole `slabs` struct.
+            let Some(slabs) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id()) else {
+                continue;
+            };
+            let indexed = slabs.index_slab_id.is_some();
 
             match mesh_key
                 .intersection(MeshPipelineKey::BLEND_RESERVED_BITS | MeshPipelineKey::MAY_DISCARD)
@@ -1540,21 +1599,20 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
                         pipeline: pipeline_id,
                         draw_function: opaque_draw,
                         material_bind_group_index: Some(material.binding.group.0),
-                        vertex_slab: vertex_slab.unwrap_or_default(),
-                        index_slab,
+                        slabs: slabs.clone(),
                         lightmap_slab: None,
                     };
                     let bin_key = Opaque3dBinKey {
-                        asset_id: mesh_instance.mesh_asset_id.into(),
+                        asset_id: mesh_instance.mesh_asset_id().into(),
                     };
 
+                    // bevy 0.19: binned `add` no longer takes a trailing change `Tick`.
                     opaque_phase.add(
                         batch_set_key,
                         bin_key,
                         (*render_entity, *visible_entity),
                         mesh_instance.current_uniform_index,
                         BinnedRenderPhaseType::mesh(false, &gpu_preprocessing_support),
-                        material_instance.last_change_tick,
                     );
                 }
                 // Alpha mask
@@ -1563,11 +1621,10 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
                         draw_function: alphamask_draw,
                         pipeline: pipeline_id,
                         material_bind_group_index: Some(material.binding.group.0),
-                        vertex_slab: vertex_slab.unwrap_or_default(),
-                        index_slab,
+                        slabs: slabs.clone(),
                     };
                     let bin_key = OpaqueNoLightmap3dBinKey {
-                        asset_id: mesh_instance.mesh_asset_id.into(),
+                        asset_id: mesh_instance.mesh_asset_id().into(),
                     };
                     alphamask_phase.add(
                         batch_set_key,
@@ -1575,12 +1632,16 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
                         (*render_entity, *visible_entity),
                         mesh_instance.current_uniform_index,
                         BinnedRenderPhaseType::mesh(false, &gpu_preprocessing_support),
-                        material_instance.last_change_tick,
                     );
                 }
                 _ => {
-                    transparent_phase.add(ImposterPhaseItem {
+                    // bevy 0.19: sorted phases use `add_retained`; `Transparent3d`
+                    // gained `sorting_info`. Bake tiles aren't depth-sorted (fixed
+                    // distance 0.0), so `AlwaysOnTop` keeps the previous behaviour.
+                    transparent_phase.add_retained(ImposterPhaseItem {
                         inner: Transparent3d {
+                            sorting_info:
+                                bevy::core_pipeline::core_3d::TransparentSortingInfo3d::AlwaysOnTop,
                             entity: (*render_entity, *visible_entity),
                             draw_function: transparent_draw,
                             pipeline: pipeline_id,
@@ -1589,7 +1650,7 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
                             distance: 0.0,
                             batch_range: 0..1,
                             extra_index: PhaseItemExtraIndex::None,
-                            indexed: index_slab.is_some(),
+                            indexed,
                         },
                     });
                 }
@@ -1598,63 +1659,71 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
     }
 }
 
-#[derive(Default, RenderLabel, Hash, Debug, PartialEq, Eq, Clone)]
-pub struct ImposterBakeNode;
-
-impl ViewNode for ImposterBakeNode {
-    type ViewQuery = (
+/// The imposter bake pass.
+///
+/// bevy 0.19 replaces render-graph `Node`s with ECS systems run from a
+/// per-camera `Schedule`. This system is registered in the [`ImposterBakeGraph`]
+/// schedule, which the camera driver runs for each `ImposterBakeCamera` (setting
+/// [`CurrentView`] to the bake camera's render-world entity). It runs after the
+/// `early_gpu_preprocess`/`late_gpu_preprocess` systems (which produce the mesh
+/// uniforms for the bake view), mirroring the old graph edges
+/// `EarlyGpuPreprocess -> LateGpuPreprocess -> ImposterBakeNode`.
+///
+/// We take `world: &World` (for `RenderPhase::render`, which needs full world
+/// access to dispatch draw functions) alongside the [`RenderContext`] system
+/// param — the same idiom bevy's own `main_opaque_pass_3d` system uses. GPU
+/// commands are recorded directly onto `ctx.command_encoder()` and the encoder
+/// is auto-flushed at the end of the system (replacing the old
+/// `add_command_buffer_generation_task` + returned `CommandBuffer`).
+#[allow(clippy::too_many_arguments)]
+pub fn imposter_bake_pass(
+    world: &World,
+    // CurrentView is the bake camera's render entity; it carries both components.
+    view: bevy::render::renderer::ViewQuery<(
         &'static ExtractedImposterBakeCamera,
         &'static ImposterResources,
-    );
+    )>,
+    opaque_phases: Res<ViewBinnedRenderPhases<ImposterPhaseItem<Opaque3d>>>,
+    alphamask_phases: Res<ViewBinnedRenderPhases<ImposterPhaseItem<AlphaMask3d>>>,
+    transparent_phases: Res<ViewSortedRenderPhases<ImposterPhaseItem<Transparent3d>>>,
+    blit_pipeline: Res<ImposterBlitPipeline>,
+    pipeline_cache: Res<PipelineCache>,
+    actual: Res<ImposterActualRenderCount>,
+    part_baked: Res<PartBaked>,
+    imposters_baked: Res<ImpostersBaked>,
+    render_device: Res<RenderDevice>,
+    mut ctx: RenderContext,
+) {
+    let (camera, textures) = view.into_inner();
 
-    fn run<'w>(
-        &self,
-        _graph: &mut bevy::render::render_graph::RenderGraphContext,
-        render_context: &mut bevy::render::renderer::RenderContext<'w>,
-        (camera, textures): bevy::ecs::query::QueryItem<'w, '_, Self::ViewQuery>,
-        world: &'w World,
-    ) -> Result<(), bevy::render::render_graph::NodeRunError> {
-        let (Some(opaque_phase), Some(alphamask_phase), Some(transparent_phase)) = (
-            world
-                .get_resource::<ViewBinnedRenderPhases<ImposterPhaseItem<Opaque3d>>>()
-                .and_then(|phases| phases.get(&camera.retained_view_entity)),
-            world
-                .get_resource::<ViewBinnedRenderPhases<ImposterPhaseItem<AlphaMask3d>>>()
-                .and_then(|phases| phases.get(&camera.retained_view_entity)),
-            world
-                .get_resource::<ViewSortedRenderPhases<ImposterPhaseItem<Transparent3d>>>()
-                .and_then(|phases| phases.get(&camera.retained_view_entity)),
-        ) else {
-            return Ok(());
-        };
+    let (Some(opaque_phase), Some(alphamask_phase), Some(transparent_phase)) = (
+        opaque_phases.get(&camera.retained_view_entity),
+        alphamask_phases.get(&camera.retained_view_entity),
+        transparent_phases.get(&camera.retained_view_entity),
+    ) else {
+        return;
+    };
 
-        let blit_pipeline = world.resource::<ImposterBlitPipeline>();
-        let pipeline_cache = world.resource::<PipelineCache>();
-        let Some(pipeline) = pipeline_cache.get_render_pipeline(blit_pipeline.pipeline) else {
-            return Ok(());
-        };
+    let Some(pipeline) = pipeline_cache.get_render_pipeline(blit_pipeline.pipeline) else {
+        return;
+    };
 
-        let actual = world.resource::<ImposterActualRenderCount>();
+    let render_device = render_device.clone();
 
-        let part_baked = world.resource::<PartBaked>();
+    {
+        // we are counting on a shared resource, so have to take a unique lock to
+        // ensure it doesn't fail when multiple bake cameras exist.
+        // probably a better way to do this
+        let _parallel_lock = actual.1.lock().unwrap();
+        let mut part_baked = part_baked.0.lock().unwrap();
+        *actual.0.lock().unwrap() = 0;
 
-        render_context.add_command_buffer_generation_task(move |render_device| {
-            // we are counting on a shared resource, so have to take a unique lock within the task to ensure it
-            // doesn't fail when multiple bake cameras exist.
-            // probably a better way to do this
-            let _parallel_lock = actual.1.lock().unwrap();
-            let mut part_baked = part_baked.0.lock().unwrap();
-            *actual.0.lock().unwrap() = 0;
+        let command_encoder = ctx.command_encoder();
 
-            let mut command_encoder =
-                render_device.create_command_encoder(&CommandEncoderDescriptor {
-                    label: Some("imposter_command_encoder"),
-                });
-
-            let mut rendered = part_baked
-                .get(&camera.retained_view_entity)
-                .copied()
-                .unwrap_or_default();
+        let mut rendered = part_baked
+            .get(&camera.retained_view_entity)
+            .copied()
+            .unwrap_or_default();
 
             // bake renders one tile at a time into the storage buffer at
             // tile_size*multisample resolution, then the blit downsamples
@@ -1685,6 +1754,8 @@ impl ViewNode for ImposterBakeNode {
                     label: Some("imposter_bake"),
                     color_attachments: &[],
                     depth_stencil_attachment: depth_attachment.clone(),
+                    // wgpu 29: new `multiview_mask` field on `RenderPassDescriptor`.
+                    multiview_mask: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
@@ -1738,6 +1809,8 @@ impl ViewNode for ImposterBakeNode {
                     label: Some("imposter_blit"),
                     color_attachments: &[Some(blit_color)],
                     depth_stencil_attachment: None,
+                    // wgpu 29: new `multiview_mask` field on `RenderPassDescriptor`.
+                    multiview_mask: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
@@ -1767,7 +1840,6 @@ impl ViewNode for ImposterBakeNode {
                 part_baked.remove(&camera.retained_view_entity);
                 if let Some(callback) = camera.callback.as_ref() {
                     debug!("send callback buffer");
-                    let render_device = world.resource::<RenderDevice>();
 
                     let buffer = render_device.create_buffer(&BufferDescriptor {
                         label: Some("imposter transfer buffer"),
@@ -1806,7 +1878,7 @@ impl ViewNode for ImposterBakeNode {
                         warn!("error sending state: {e}");
                     }
 
-                    let _ = world.resource::<ImpostersBaked>().sender.send((
+                    let _ = imposters_baked.sender.send((
                         camera.tile_size * camera.grid_size,
                         callback.clone(),
                         camera.channel.clone(),
@@ -1833,11 +1905,6 @@ impl ViewNode for ImposterBakeNode {
                     );
                 }
             }
-
-            command_encoder.finish()
-        });
-
-        Ok(())
     }
 }
 
