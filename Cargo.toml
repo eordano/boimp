@@ -5,14 +5,14 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-bevy = { git = "https://github.com/robtfm/bevy", branch = "release-0.16-dcl", default-features=false, features = [
+bevy = { version = "0.17", default-features=false, features = [
     "bevy_core_pipeline",
-    "bevy_render", 
+    "bevy_render",
     "bevy_pbr",
     "bevy_log",
     "bevy_asset"
 ] }
-wgpu = "24"
+wgpu = "25"
 crossbeam-channel = "*"
 async-channel = "*"
 image = "*"
@@ -27,4 +27,10 @@ serde = { version = "1", features = ["derive"] }
 [dev-dependencies]
 pico-args = "0.5.0"
 rand = "0.8.5"
-bevy = { git = "https://github.com/robtfm/bevy", branch = "release-0.16-dcl", default-features = true }
+bevy = { version = "0.17", default-features = true }
+
+# Build against the local DCL bevy fork (release-0.17-dcl). boimp relies on
+# DCL-fork-only APIs (e.g. RenderAssetTransferPriority / Image::transfer_priority)
+# that are not present in upstream crates.io bevy 0.17.
+[patch.crates-io]
+bevy = { path = "/home/dcl/bevy-fork" }

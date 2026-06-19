@@ -12,29 +12,37 @@ use bevy::{
     asset::{load_internal_asset, weak_handle},
     core_pipeline::{
         core_3d::{AlphaMask3d, Opaque3d, Opaque3dBatchSetKey, Opaque3dBinKey, Transparent3d},
-        fullscreen_vertex_shader::fullscreen_shader_vertex_state,
         prepass::{OpaqueNoLightmap3dBatchSetKey, OpaqueNoLightmap3dBinKey},
+        FullscreenShader,
     },
     ecs::system::lifetimeless::SRes,
     image::{ImageSampler, TextureFormatPixelInfo},
     pbr::{
         alpha_mode_pipeline_key, graph::NodePbr, prepare_preprocess_bind_groups, DrawMesh,
-        EarlyGpuPreprocessNode, ExtendedMaterial, LateGpuPreprocessNode,
-        MaterialBindGroupAllocator, MaterialExtension, MaterialPipelineKey, MeshPipeline,
-        MeshPipelineKey, PreparedMaterial, PrepassPipeline, PreprocessBindGroups,
-        RenderMaterialInstances, RenderMeshInstances, SetMaterialBindGroup, SetMeshBindGroup,
-        SetPrepassViewBindGroup, SkipGpuPreprocess,
+        EarlyGpuPreprocessNode, ErasedMaterialPipelineKey, ExtendedMaterial, LateGpuPreprocessNode,
+        MaterialBindGroupAllocators, MaterialExtension, MeshPipeline,
+        MeshPipelineKey, PreparedMaterial, PrepassPipeline, PrepassPipelineSpecializer,
+        PreprocessBindGroups, RenderMaterialInstances, RenderMeshInstances, SetMaterialBindGroup,
+        SetMeshBindGroup, SetPrepassViewBindGroup, SetPrepassViewEmptyBindGroup, SkipGpuPreprocess,
     },
     platform::collections::{HashMap, HashSet},
     prelude::*,
+    // bevy 0.17 split bevy_render: camera/projection/visibility/primitives types
+    // moved to bevy_camera (facade: `bevy::camera`); the rest stay in bevy_render.
+    camera::{
+        primitives::{Aabb, Sphere},
+        visibility::{
+            NoFrustumCulling, PreviousVisibleEntities, RenderLayers, VisibilitySystems,
+            VisibleEntities,
+        },
+        CameraOutputMode, CameraProjection, ScalingMode,
+    },
     render::{
         batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
-        camera::{
-            CameraOutputMode, CameraProjection, CameraRenderGraph, ExtractedCamera, ScalingMode,
-        },
+        camera::{CameraRenderGraph, ExtractedCamera},
+        erased_render_asset::{prepare_erased_assets, ErasedRenderAssets},
         mesh::{allocator::MeshAllocator, RenderMesh},
-        primitives::{Aabb, Sphere},
-        render_asset::{prepare_assets, RenderAssetUsages, RenderAssets},
+        render_asset::{RenderAssetUsages, RenderAssets},
         render_graph::{RenderGraphApp, RenderLabel, RenderSubGraph, ViewNode, ViewNodeRunner},
         render_phase::{
             AddRenderCommand, BinnedPhaseItem, BinnedRenderPhasePlugin, BinnedRenderPhaseType,
@@ -56,11 +64,10 @@ use bevy::{
         sync_world::{MainEntity, RenderEntity, SyncToRenderWorld},
         texture::{CachedTexture, GpuImage, TextureCache},
         view::{
-            ColorGrading, ExtractedView, NoFrustumCulling, NoIndirectDrawing,
-            PreviousVisibleEntities, RenderLayers, RenderVisibleEntities, RetainedViewEntity,
-            ViewDepthTexture, ViewUniformOffset, VisibilitySystems, VisibleEntities,
+            ColorGrading, ExtractedView, NoIndirectDrawing, RenderVisibleEntities,
+            RetainedViewEntity, ViewDepthTexture, ViewUniformOffset,
         },
-        Extract, Render, RenderApp, RenderDebugFlags, RenderSet,
+        Extract, Render, RenderApp, RenderDebugFlags, RenderSet, RenderStartup,
     },
     tasks::AsyncComputeTaskPool,
     utils::Parallel,
@@ -198,7 +205,12 @@ impl Plugin for ImposterBakePlugin {
 
         render_app
             .init_resource::<BakeStorageBindGroupLayout>()
-            .init_resource::<ImposterBlitPipeline>();
+            .init_resource::<ImposterBlitPipeline>()
+            // bevy 0.17: the draw command is material-type-independent now, so
+            // register it once here rather than per material plugin.
+            .add_render_command::<ImposterPhaseItem<Opaque3d>, DrawImposter>()
+            .add_render_command::<ImposterPhaseItem<AlphaMask3d>, DrawImposter>()
+            .add_render_command::<ImposterPhaseItem<Transparent3d>, DrawImposter>();
     }
 }
 
@@ -287,20 +299,21 @@ where
         };
 
         render_app
-            // ImposterBakePipeline::from_world reads this resource; depending on
+            // ImposterBakePipeline reads BakeStorageBindGroupLayout; depending on
             // the order plugin finish() runs, it may not yet be initialized by
             // ImposterBakePlugin::finish. init_resource is idempotent.
             .init_resource::<BakeStorageBindGroupLayout>()
-            .init_resource::<ImposterBakePipeline<M>>()
-            .init_resource::<SpecializedMeshPipelines<ImposterBakePipeline<M>>>()
-            .add_render_command::<ImposterPhaseItem<Opaque3d>, DrawImposter<M>>()
-            .add_render_command::<ImposterPhaseItem<AlphaMask3d>, DrawImposter<M>>()
-            .add_render_command::<ImposterPhaseItem<Transparent3d>, DrawImposter<M>>()
+            // In bevy 0.17 PrepassPipeline is only created during RenderStartup
+            // (init_prepass_pipeline), so ImposterBakePipeline can no longer be
+            // built via FromWorld in finish() — it must be initialised in a
+            // RenderStartup system that runs after the prepass pipeline exists.
+            .init_resource::<SpecializedMeshPipelines<ImposterBakePipelineSpecializer<M>>>()
+            .add_systems(RenderStartup, init_imposter_bake_pipeline::<M>)
             .add_systems(
                 Render,
                 queue_imposter_material_meshes::<M>
                     .in_set(RenderSet::QueueMeshes)
-                    .after(prepare_assets::<PreparedMaterial<M>>),
+                    .after(prepare_erased_assets::<MeshMaterial3d<M>>),
             );
     }
 }
@@ -1009,35 +1022,58 @@ fn copy_preprocess_bindgroups(
 
 #[derive(Resource)]
 pub struct ImposterBakePipeline<M: ImposterBakeMaterial> {
-    prepass_pipeline: PrepassPipeline<M>,
+    prepass_pipeline: PrepassPipeline,
     frag_shader: Handle<Shader>,
     storage_layout: BindGroupLayout,
+    _p: PhantomData<fn() -> M>,
 }
 
-impl<M: ImposterBakeMaterial> FromWorld for ImposterBakePipeline<M> {
-    fn from_world(world: &mut World) -> Self {
-        Self {
-            prepass_pipeline: PrepassPipeline::from_world(world),
-            frag_shader: match M::imposter_fragment_shader() {
-                ShaderRef::Default => panic!(),
-                ShaderRef::Handle(handle) => handle,
-                ShaderRef::Path(path) => world.resource::<AssetServer>().load(path),
-            },
-            storage_layout: world.resource::<BakeStorageBindGroupLayout>().0.clone(),
-        }
-    }
+/// Builds the [`ImposterBakePipeline`] in `RenderStartup`. In bevy 0.17
+/// `PrepassPipeline` is no longer generic and is created by a `RenderStartup`
+/// system (`init_prepass_pipeline`), so we read it as a resource here rather
+/// than building it via `FromWorld` in `finish()`.
+pub fn init_imposter_bake_pipeline<M: ImposterBakeMaterial>(
+    mut commands: Commands,
+    prepass_pipeline: Res<PrepassPipeline>,
+    storage_layout: Res<BakeStorageBindGroupLayout>,
+    asset_server: Res<AssetServer>,
+) {
+    let frag_shader = match M::imposter_fragment_shader() {
+        ShaderRef::Default => panic!(),
+        ShaderRef::Handle(handle) => handle,
+        ShaderRef::Path(path) => asset_server.load(path),
+    };
+    commands.insert_resource(ImposterBakePipeline::<M> {
+        prepass_pipeline: prepass_pipeline.clone(),
+        frag_shader,
+        storage_layout: storage_layout.0.clone(),
+        _p: PhantomData,
+    });
 }
 
-impl<M: ImposterBakeMaterial> SpecializedMeshPipeline for ImposterBakePipeline<M>
+/// Per-material specializer for the imposter bake pipeline. In bevy 0.17 the
+/// prepass specialization moved into [`PrepassPipelineSpecializer`] (which is
+/// constructed per-material from its [`MaterialProperties`]), so we mirror that:
+/// we build a prepass specializer, run it, then apply our bake-specific
+/// overrides (force the fragment shader, drop colour targets, append the bake
+/// storage bind group).
+pub struct ImposterBakePipelineSpecializer<M: ImposterBakeMaterial> {
+    prepass: PrepassPipelineSpecializer,
+    frag_shader: Handle<Shader>,
+    storage_layout: BindGroupLayout,
+    _p: PhantomData<fn() -> M>,
+}
+
+impl<M: ImposterBakeMaterial> SpecializedMeshPipeline for ImposterBakePipelineSpecializer<M>
 where
     M::Data: PartialEq + Eq + Hash + Clone,
 {
-    type Key = MaterialPipelineKey<M>;
+    type Key = ErasedMaterialPipelineKey;
 
     fn specialize(
         &self,
         key: Self::Key,
-        layout: &bevy::render::mesh::MeshVertexBufferLayoutRef,
+        layout: &bevy::mesh::MeshVertexBufferLayoutRef,
     ) -> Result<
         bevy::render::render_resource::RenderPipelineDescriptor,
         bevy::render::render_resource::SpecializedMeshPipelineError,
@@ -1046,12 +1082,13 @@ where
         // would be glorious if this was abstracted so we could avoid cheating like this, or copy/pasting 250 lines
 
         // add MAY_DISCARD to force fragment shader
-        let key = MaterialPipelineKey {
+        let key = ErasedMaterialPipelineKey {
             mesh_key: key.mesh_key.union(MeshPipelineKey::MAY_DISCARD),
-            bind_group_data: key.bind_group_data,
+            material_key: key.material_key,
+            type_id: key.type_id,
         };
 
-        let mut descriptor = self.prepass_pipeline.specialize(key, layout)?;
+        let mut descriptor = self.prepass.specialize(key, layout)?;
         descriptor.label =
             Some(format!("imposter_bake_pipeline {}", std::any::type_name::<M>()).into());
 
@@ -1115,12 +1152,13 @@ where
         descriptor.fragment = Some(FragmentState {
             shader: self.frag_shader.clone(),
             shader_defs: frag_defs,
-            entry_point: "fragment".into(),
+            entry_point: Some("fragment".into()),
             targets: vec![],
         });
 
-        // append our storage-texture bind group layout. assumes the prepass
-        // pipeline put view/mesh/material at 0/1/2.
+        // append our storage-texture bind group layout. the prepass pipeline
+        // puts view/empty/mesh/material at 0/1/2/3 (bevy 0.17), so our storage
+        // group lands at index 4.
         descriptor.layout.push(self.storage_layout.clone());
 
         Ok(descriptor)
@@ -1143,6 +1181,10 @@ pub struct ImposterBlitPipeline {
 
 impl FromWorld for ImposterBlitPipeline {
     fn from_world(world: &mut World) -> Self {
+        // bevy 0.17: the free `fullscreen_shader_vertex_state()` fn is gone;
+        // the fullscreen vertex state now comes from the `FullscreenShader`
+        // resource (created in CorePipelinePlugin::build, so available here).
+        let vertex = world.resource::<FullscreenShader>().to_vertex_state();
         let device = world.resource::<RenderDevice>();
         let pipeline_cache = world.resource::<PipelineCache>();
 
@@ -1161,11 +1203,11 @@ impl FromWorld for ImposterBlitPipeline {
         let pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
             label: Some("imposter_blit_render_pipeline".into()),
             layout: vec![layout.clone()],
-            vertex: fullscreen_shader_vertex_state(),
+            vertex,
             fragment: Some(FragmentState {
                 shader: IMPOSTER_BLIT_HANDLE,
                 shader_defs: Vec::default(),
-                entry_point: "blend_materials".into(),
+                entry_point: Some("blend_materials".into()),
                 targets: vec![Some(ColorTargetState {
                     format: TextureFormat::Rg32Uint,
                     blend: None,
@@ -1343,31 +1385,37 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
     mut alphamask_render_phases: ResMut<ViewBinnedRenderPhases<ImposterPhaseItem<AlphaMask3d>>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<ImposterPhaseItem<Transparent3d>>>,
     imposter_pipeline: Res<ImposterBakePipeline<M>>,
-    mut pipelines: ResMut<SpecializedMeshPipelines<ImposterBakePipeline<M>>>,
+    mut pipelines: ResMut<SpecializedMeshPipelines<ImposterBakePipelineSpecializer<M>>>,
     pipeline_cache: Res<PipelineCache>,
     render_meshes: Res<RenderAssets<RenderMesh>>,
     render_mesh_instances: Res<RenderMeshInstances>,
-    render_materials: Res<RenderAssets<PreparedMaterial<M>>>,
+    render_materials: Res<ErasedRenderAssets<PreparedMaterial>>,
     render_material_instances: Res<RenderMaterialInstances>,
     mesh_allocator: Res<MeshAllocator>,
-    (gpu_preprocessing_support, material_bind_group_allocator): (
+    (gpu_preprocessing_support, material_bind_group_allocators): (
         Res<GpuPreprocessingSupport>,
-        Res<MaterialBindGroupAllocator<M>>,
+        Res<MaterialBindGroupAllocators>,
     ),
 ) where
     M::Data: PartialEq + Eq + Hash + Clone,
 {
-    let opaque_draw = opaque_draw_functions
-        .read()
-        .get_id::<DrawImposter<M>>()
-        .unwrap();
+    // Only handle materials of our concrete type M (the erased asset store and
+    // the material-instance map are untyped in bevy 0.17).
+    let our_type_id = TypeId::of::<M>();
+    // The per-material-type bind group allocator (used to validate the material
+    // is actually resident on the gpu before queueing).
+    let Some(material_bind_group_allocator) = material_bind_group_allocators.get(&our_type_id)
+    else {
+        return;
+    };
+    let opaque_draw = opaque_draw_functions.read().get_id::<DrawImposter>().unwrap();
     let alphamask_draw = alphamask_draw_functions
         .read()
-        .get_id::<DrawImposter<M>>()
+        .get_id::<DrawImposter>()
         .unwrap();
     let transparent_draw = transparent_draw_functions
         .read()
-        .get_id::<DrawImposter<M>>()
+        .get_id::<DrawImposter>()
         .unwrap();
 
     for (camera, visible_entities) in &mut views {
@@ -1393,17 +1441,21 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
             let Some(mesh) = render_meshes.get(mesh_instance.mesh_asset_id) else {
                 continue;
             };
-            let Ok(material_asset_id) = material_instance.asset_id.try_typed::<M>() else {
+            // Skip materials that aren't our concrete type, then look them up
+            // untyped in the erased prepared-material store.
+            if material_instance.asset_id.type_id() != our_type_id {
+                continue;
+            }
+            let Some(material) = render_materials.get(material_instance.asset_id) else {
                 continue;
             };
-            let Some(material) = render_materials.get(material_asset_id) else {
+            // Ensure the material's bind group is actually resident.
+            if material_bind_group_allocator
+                .get(material.binding.group)
+                .is_none()
+            {
                 continue;
-            };
-            let Some(material_bind_group) =
-                material_bind_group_allocator.get(material.binding.group)
-            else {
-                continue;
-            };
+            }
 
             let mut mesh_key = view_key | MeshPipelineKey::from_bits_retain(mesh.key_bits.bits());
 
@@ -1423,15 +1475,27 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
             //     mesh_key |= MeshPipelineKey::LIGHTMAPPED;
             // }
 
+            // bevy 0.17: build the erased material pipeline key (carries the
+            // material's bind_group_data via `material_key`) and a per-material
+            // prepass specializer wrapped by our bake specializer.
+            let erased_key = ErasedMaterialPipelineKey {
+                mesh_key,
+                material_key: material.properties.material_key.clone(),
+                type_id: our_type_id,
+            };
+            let bake_specializer = ImposterBakePipelineSpecializer::<M> {
+                prepass: PrepassPipelineSpecializer {
+                    pipeline: imposter_pipeline.prepass_pipeline.clone(),
+                    properties: material.properties.clone(),
+                },
+                frag_shader: imposter_pipeline.frag_shader.clone(),
+                storage_layout: imposter_pipeline.storage_layout.clone(),
+                _p: PhantomData,
+            };
             let pipeline_id = pipelines.specialize(
                 &pipeline_cache,
-                &imposter_pipeline,
-                MaterialPipelineKey {
-                    mesh_key,
-                    bind_group_data: material_bind_group
-                        .get_extra_data(material.binding.slot)
-                        .clone(),
-                },
+                &bake_specializer,
+                erased_key,
                 &mesh.layout,
             );
             let pipeline_id = match pipeline_id {
@@ -1601,7 +1665,9 @@ impl ViewNode for ImposterBakeNode {
                     occlusion_query_set: None,
                 });
                 let mut render_pass = TrackedRenderPass::new(&render_device, render_pass);
-                render_pass.set_bind_group(3, &textures.bake_bindgroup, &[]);
+                // group 3 is the material bind group (set by the draw command);
+                // our bake storage buffer lives at group 4 in bevy 0.17.
+                render_pass.set_bind_group(4, &textures.bake_bindgroup, &[]);
                 render_pass.set_viewport(
                     0.0,
                     0.0,
@@ -1854,11 +1920,19 @@ impl<P: PhaseItem> RenderCommand<P> for CountRenderCommand {
     }
 }
 
-pub type DrawImposter<M> = (
+// bevy 0.17 bind-group layout for a prepass-style draw:
+//   0 = view, 1 = empty view bind group, 2 = mesh, 3 = material.
+// `SetMaterialBindGroup` is no longer generic over the material type; the
+// `M` parameter is retained on the alias for API compatibility with callers.
+// In bevy 0.17 `SetMaterialBindGroup` is no longer generic over the material
+// type, so this draw command is material-type-independent and is registered
+// once (not per material type).
+pub type DrawImposter = (
     SetItemPipeline,
     SetPrepassViewBindGroup<0>,
-    SetMeshBindGroup<1>,
-    SetMaterialBindGroup<M, 2>,
+    SetPrepassViewEmptyBindGroup<1>,
+    SetMeshBindGroup<2>,
+    SetMaterialBindGroup<3>,
     DrawMesh,
     CountRenderCommand,
 );

@@ -10,8 +10,10 @@ struct BakeDims {
     width: u32,
 }
 
-@group(3) @binding(0) var<storage, read_write> bake_buffer: array<vec2<u32>>;
-@group(3) @binding(1) var<uniform> bake_dims: BakeDims;
+// group 3 is the material bind group (MATERIAL_BIND_GROUP_INDEX in bevy 0.17);
+// the bake storage buffer is appended after it, so it lives at group 4.
+@group(4) @binding(0) var<storage, read_write> bake_buffer: array<vec2<u32>>;
+@group(4) @binding(1) var<uniform> bake_dims: BakeDims;
 
 @fragment
 fn fragment(

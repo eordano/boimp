@@ -194,9 +194,9 @@ impl Material for Imposter {
     }
 
     fn specialize(
-        _: &bevy::pbr::MaterialPipeline<Self>,
+        _: &bevy::pbr::MaterialPipeline,
         descriptor: &mut bevy::render::render_resource::RenderPipelineDescriptor,
-        _: &bevy::render::mesh::MeshVertexBufferLayoutRef,
+        _: &bevy::mesh::MeshVertexBufferLayoutRef,
         key: bevy::pbr::MaterialPipelineKey<Self>,
     ) -> Result<(), bevy::render::render_resource::SpecializedMeshPipelineError> {
         let vert_defs = &mut descriptor.vertex.shader_defs;

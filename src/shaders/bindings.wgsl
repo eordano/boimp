@@ -14,14 +14,14 @@
     weighted_props,
 };
 
-@group(2) @binding(0)
+@group(#{MATERIAL_BIND_GROUP}) @binding(0)
 var<uniform> imposter_data: ImposterData;
 
-@group(2) @binding(1) 
+@group(#{MATERIAL_BIND_GROUP}) @binding(1)
 var imposter_pixels: texture_2d<u32>;
 
 #ifdef INDEXED_PIXELS
-@group(2) @binding(2)
+@group(#{MATERIAL_BIND_GROUP}) @binding(2)
 var imposter_indices: texture_2d<u32>;
 #endif
 
@@ -32,11 +32,11 @@ var imposter_indices: texture_2d<u32>;
 // depth palette. Bindings are always present (dummy fallback for variants
 // that don't use them) — the shader only reads the relevant ones under
 // matching `INDEXED_V2_12` / `INDEXED_V2_14` / `INDEXED_V2_10S` defs.
-@group(2) @binding(2)
+@group(#{MATERIAL_BIND_GROUP}) @binding(2)
 var imposter_indices: texture_2d<u32>;
-@group(2) @binding(3)
+@group(#{MATERIAL_BIND_GROUP}) @binding(3)
 var imposter_indices_hi: texture_2d<u32>;
-@group(2) @binding(4)
+@group(#{MATERIAL_BIND_GROUP}) @binding(4)
 var imposter_depth_palette: texture_2d<u32>;
 #endif
 
