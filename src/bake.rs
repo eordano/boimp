@@ -310,7 +310,12 @@ where
             // built via FromWorld in finish() — it must be initialised in a
             // RenderStartup system that runs after the prepass pipeline exists.
             .init_resource::<SpecializedMeshPipelines<ImposterBakePipelineSpecializer<M>>>()
-            .add_systems(RenderStartup, init_imposter_bake_pipeline::<M>)
+            // must run after bevy creates PrepassPipeline (also a RenderStartup
+            // system in 0.17), which init_imposter_bake_pipeline reads.
+            .add_systems(
+                RenderStartup,
+                init_imposter_bake_pipeline::<M>.after(bevy::pbr::init_prepass_pipeline),
+            )
             .add_systems(
                 Render,
                 queue_imposter_material_meshes::<M>
