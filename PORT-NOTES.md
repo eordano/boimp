@@ -144,3 +144,66 @@ in `bevy_core_pipeline`/`bevy_image`, plus the two items above) and did not
 compile during this work. boimp's own source is ported to the 0.17 APIs as
 documented; final `cargo build` verification is blocked on the fork compiling
 and on fork change (2) above.
+
+---
+
+## Fork-integration completion (2026-06-19)
+
+The crate now builds green against the DCL fork. `cargo build`,
+`cargo build --examples`, and `cargo build --all-targets` all finish with 0
+errors (warnings only). Fixes applied this pass:
+
+### wgpu version bump (the big one)
+`Cargo.toml`: `wgpu = "25"` -> `wgpu = "26"`. The fork's `bevy_render`/`bevy_image`
+use `wgpu-types` 26, but boimp pinned wgpu 25, so two copies of `wgpu_types`
+coexisted in the graph and every `Extent3d`/`TextureDimension`/`TextureFormat`
+passed into `Image::new`/`GpuImage`/`create_buffer` was the wrong type
+(~30 E0308 "arguments are incorrect" / "mismatched types"). Bumping to 26
+unified the types and cleared all of them at once. `Image::new`'s signature
+itself is unchanged in the fork (`size, dimension, data, format, asset_usage`);
+the new `transfer_priority` field is filled internally by `new_uninit`, so
+boimp's call sites needed no extra args.
+
+### TextureFormat::pixel_size() now returns Result
+The fork's `pixel_size()` returns `Result<usize, TextureAccessError>`. Added
+`.unwrap()` at the 3 boimp call sites (all on the fixed `Rg32Uint` format, which
+never errors): `bake.rs` lines ~1757, ~1771, ~1851. This cleared the 3 E0605
+non-primitive-cast and 2 E0277 "cannot multiply usize by Result" errors.
+
+### Shader types moved to bevy_shader
+`ShaderRef` / `ShaderDefVal` left `bevy::render::render_resource` for
+`bevy::shader` (facade for `bevy_shader`). Updated imports in `bake.rs` and
+`render.rs`.
+
+### RenderGraphApp -> RenderGraphExt
+The render-graph app-extension trait was renamed; `add_render_sub_graph` lives on
+`RenderGraphExt` now (`bevy::render::render_graph::RenderGraphExt`). Updated the
+import in `bake.rs`.
+
+### QueryItem / ROQueryItem gained a second lifetime
+`QueryItem<'w, Q>` -> `QueryItem<'w, '_, Q>` (and same for `ROQueryItem`) in the
+`ViewNode::run` and `RenderCommand::render` impls in `bake.rs`.
+
+### ExtendedMaterial gained a base-material generic
+`impl ... for ExtendedMaterial<E>` -> `impl<B: Material, ...> ... for
+ExtendedMaterial<B, E>` to match bevy 0.17's `ExtendedMaterial<B, E>`.
+
+### RenderPassColorAttachment gained depth_slice
+Added `depth_slice: None` to the `wgpu::RenderPassColorAttachment` literal in
+`bake.rs` (wgpu 26 field).
+
+### Examples (0.17 API migrations, not fork-specific)
+- `bevy::render::primitives::{Aabb, Sphere}` -> `bevy::camera::primitives::...`
+  (culling `Sphere` with `.center`, distinct from the `prelude::Sphere` mesh
+  primitive which only has `radius`); `bevy::render::view::RenderLayers` ->
+  `bevy::camera::visibility::RenderLayers` (save_asset.rs, dynamic.rs).
+- `Handle::clone_weak()` removed -> `.clone()` (save_asset.rs, dynamic.rs).
+- `bevy::render::mesh::VertexAttributeValues` -> `bevy::mesh::VertexAttributeValues`
+  (custom_mesh.rs).
+- Cursor settings split out of `Window` into a `CursorOptions` component:
+  query changed to `(&Window, &mut CursorOptions)` and field accesses moved off
+  `window.cursor_options.*` (helpers/camera_controller.rs).
+
+### Status
+GREEN. `dcl-shell -c "cd /home/dcl/boimp-fork && cargo build"` succeeds; the
+earlier "fork mid-merge" blocker noted above is resolved.

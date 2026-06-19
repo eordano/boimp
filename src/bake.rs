@@ -43,7 +43,7 @@ use bevy::{
         erased_render_asset::{prepare_erased_assets, ErasedRenderAssets},
         mesh::{allocator::MeshAllocator, RenderMesh},
         render_asset::{RenderAssetUsages, RenderAssets},
-        render_graph::{RenderGraphApp, RenderLabel, RenderSubGraph, ViewNode, ViewNodeRunner},
+        render_graph::{RenderGraphExt, RenderLabel, RenderSubGraph, ViewNode, ViewNodeRunner},
         render_phase::{
             AddRenderCommand, BinnedPhaseItem, BinnedRenderPhasePlugin, BinnedRenderPhaseType,
             CachedRenderPipelinePhaseItem, DrawFunctionId, DrawFunctions, PhaseItem,
@@ -56,7 +56,7 @@ use bevy::{
             BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries, Buffer,
             BufferDescriptor, CachedRenderPipelineId, ColorTargetState, ColorWrites,
             CommandEncoderDescriptor, Extent3d, FragmentState, PipelineCache, RenderPassDescriptor,
-            RenderPipelineDescriptor, ShaderDefVal, ShaderRef, ShaderType, SpecializedMeshPipeline,
+            RenderPipelineDescriptor, ShaderType, SpecializedMeshPipeline,
             SpecializedMeshPipelines, StoreOp, Texture, TextureDescriptor, TextureDimension,
             TextureFormat, TextureUsages, UniformBuffer,
         },
@@ -69,6 +69,8 @@ use bevy::{
         },
         Extract, Render, RenderApp, RenderDebugFlags, RenderSet, RenderStartup,
     },
+    // bevy 0.17 moved shader types out of bevy_render into bevy_shader (facade: `bevy::shader`).
+    shader::{ShaderDefVal, ShaderRef},
     tasks::AsyncComputeTaskPool,
     utils::Parallel,
 };
@@ -318,8 +320,11 @@ where
     }
 }
 
-impl<E: MaterialExtension + ImposterBakeMaterialExtension> ImposterBakeMaterial
-    for ExtendedMaterial<E>
+// bevy 0.17's ExtendedMaterial takes two generics: the base material B and the
+// extension E. The original boimp targeted an older bevy where ExtendedMaterial
+// took a single generic, so we add the base-material parameter here.
+impl<B: Material, E: MaterialExtension + ImposterBakeMaterialExtension> ImposterBakeMaterial
+    for ExtendedMaterial<B, E>
 {
     fn imposter_fragment_shader() -> ShaderRef {
         E::imposter_fragment_shader()
@@ -1587,7 +1592,7 @@ impl ViewNode for ImposterBakeNode {
         &self,
         _graph: &mut bevy::render::render_graph::RenderGraphContext,
         render_context: &mut bevy::render::renderer::RenderContext<'w>,
-        (camera, textures): bevy::ecs::query::QueryItem<'w, Self::ViewQuery>,
+        (camera, textures): bevy::ecs::query::QueryItem<'w, '_, Self::ViewQuery>,
         world: &'w World,
     ) -> Result<(), bevy::render::render_graph::NodeRunError> {
         let (Some(opaque_phase), Some(alphamask_phase), Some(transparent_phase)) = (
@@ -1703,6 +1708,7 @@ impl ViewNode for ImposterBakeNode {
                 // the output texture (downsampling by `multisample` if set).
                 let blit_color = wgpu::RenderPassColorAttachment {
                     view: &textures.output.default_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
@@ -1749,7 +1755,7 @@ impl ViewNode for ImposterBakeNode {
                         size: get_aligned_size(
                             camera.tile_size * camera.grid_size,
                             camera.tile_size * camera.grid_size,
-                            TextureFormat::Rg32Uint.pixel_size() as u32,
+                            TextureFormat::Rg32Uint.pixel_size().unwrap() as u32,
                         ) as u64,
                         usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
                         mapped_at_creation: false,
@@ -1763,7 +1769,7 @@ impl ViewNode for ImposterBakeNode {
                                 bytes_per_row: Some(get_aligned_size(
                                     camera.tile_size * camera.grid_size,
                                     1,
-                                    TextureFormat::Rg32Uint.pixel_size() as u32,
+                                    TextureFormat::Rg32Uint.pixel_size().unwrap() as u32,
                                 )),
                                 ..Default::default()
                             },
@@ -1843,7 +1849,7 @@ pub fn copy_back(baked: Res<ImpostersBaked>) {
             drop(data);
             drop(buffer);
 
-            let pixel_size = TextureFormat::Rg32Uint.pixel_size();
+            let pixel_size = TextureFormat::Rg32Uint.pixel_size().unwrap();
 
             if result.len() != (image_size * image_size) as usize * pixel_size {
                 // Our buffer has been padded because we needed to align to a multiple of 256.
@@ -1910,8 +1916,8 @@ impl<P: PhaseItem> RenderCommand<P> for CountRenderCommand {
 
     fn render<'w>(
         _: &P,
-        _: bevy::ecs::query::ROQueryItem<'w, Self::ViewQuery>,
-        _: Option<bevy::ecs::query::ROQueryItem<'w, Self::ItemQuery>>,
+        _: bevy::ecs::query::ROQueryItem<'w, '_, Self::ViewQuery>,
+        _: Option<bevy::ecs::query::ROQueryItem<'w, '_, Self::ItemQuery>>,
         count: bevy::ecs::system::SystemParamItem<'w, '_, Self::Param>,
         _: &mut TrackedRenderPass<'w>,
     ) -> bevy::render::render_phase::RenderCommandResult {

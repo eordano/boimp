@@ -11,9 +11,10 @@ use bevy::{
     math::FloatOrd,
     platform::collections::HashMap,
     prelude::*,
-    render::{
+    // bevy 0.17 moved culling primitives + RenderLayers from bevy_render to bevy_camera.
+    camera::{
         primitives::{Aabb, Sphere},
-        view::RenderLayers,
+        visibility::RenderLayers,
     },
     scene::InstanceId,
 };
@@ -217,7 +218,7 @@ fn scene_load_check(
                     ))
                     .id();
                 scene_handle.instance_id =
-                    Some(scene_spawner.spawn_as_child(gltf_scene_handle.clone_weak(), root));
+                    Some(scene_spawner.spawn_as_child(gltf_scene_handle.clone(), root));
 
                 info!("Spawning scene...");
             }

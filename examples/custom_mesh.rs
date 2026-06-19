@@ -36,7 +36,7 @@ fn setup(
     };
 
     let mut mesh = Cuboid::default().mesh().build();
-    let Some(bevy::render::mesh::VertexAttributeValues::Float32x2(uvs)) =
+    let Some(bevy::mesh::VertexAttributeValues::Float32x2(uvs)) =
         mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0)
     else {
         panic!()

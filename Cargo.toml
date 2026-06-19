@@ -12,7 +12,7 @@ bevy = { version = "0.17", default-features=false, features = [
     "bevy_log",
     "bevy_asset"
 ] }
-wgpu = "25"
+wgpu = "26"
 crossbeam-channel = "*"
 async-channel = "*"
 image = "*"

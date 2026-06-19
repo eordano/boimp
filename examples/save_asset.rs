@@ -4,7 +4,8 @@
 use bevy::{
     asset::LoadState,
     prelude::*,
-    render::primitives::{Aabb, Sphere},
+    // bevy 0.17 moved culling primitives (Aabb / bounding Sphere) to bevy_camera.
+    camera::primitives::{Aabb, Sphere},
     scene::InstanceId,
     window::ExitCondition,
 };
@@ -192,7 +193,7 @@ fn scene_load_check(
                         // .insert(Rotate)
                         .id();
                     scene_handle.instance_id =
-                        Some(scene_spawner.spawn_as_child(gltf_scene_handle.clone_weak(), root));
+                        Some(scene_spawner.spawn_as_child(gltf_scene_handle.clone(), root));
 
                     info!("Spawning scene...");
                 }

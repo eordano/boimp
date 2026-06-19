@@ -3,8 +3,10 @@ use bevy::{
     prelude::*,
     render::{
         render_asset::RenderAssetUsages,
-        render_resource::{AsBindGroup, ShaderRef, ShaderType},
+        render_resource::{AsBindGroup, ShaderType},
     },
+    // bevy 0.17 moved ShaderRef out of bevy_render into bevy_shader (facade: `bevy::shader`).
+    shader::ShaderRef,
 };
 use wgpu::{Extent3d, TextureFormat};
 
