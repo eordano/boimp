@@ -372,14 +372,14 @@ fn single_sample_clamped(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: v
 fn sample_tile_material(sample: UVSample, grid_index: vec2<u32>, coord_offset: vec2<f32>) -> UnpackedMaterialProps {
     let bounds_min = vec2<f32>(grid_index * imposter_data.packed_size);
     let bounds_max = bounds_min + vec2<f32>(imposter_data.packed_size);
-    let coords_unadjusted = bounds_min - vec2<f32>(imposter_data.packed_offset) + sample.initial_uv * vec2<f32>(imposter_data.base_tile_size) + coord_offset;
+    let coords_unadjusted = bounds_min - vec2<f32>(imposter_data.packed_offset) + sample.initial_uv * vec2<f32>(f32(imposter_data.base_tile_size)) + coord_offset;
     // Linear tile index for the idx10s per-tile depth-palette lookup.
     let tile_idx = grid_index.y * imposter_data.grid_size + grid_index.x;
 
     // The texture's `depth` field is the surface depth relative to the mid
     // plane. When the anchor UV is itself at `initial_depth != 0`, the
     // perspective shift from the anchor to the surface uses the *delta*.
-    let depth_shift = sample.dduddv * vec2<f32>(imposter_data.base_tile_size);
+    let depth_shift = sample.dduddv * vec2<f32>(f32(imposter_data.base_tile_size));
 
 #ifdef MATERIAL_MULTISAMPLE
         // multisample for depth
