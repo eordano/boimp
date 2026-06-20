@@ -17,7 +17,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
-use bevy::log::{debug, info};
+use bevy::log::debug;
 
 pub struct QuantResult {
     /// At most `k` entries. Each entry is an [u8; 8] packed in the same

@@ -1,5 +1,5 @@
 use bevy::{
-    asset::{load_internal_asset, weak_handle},
+    asset::{load_internal_asset, uuid_handle},
     prelude::*,
     render::{
         render_asset::RenderAssetUsages,
@@ -15,10 +15,10 @@ use crate::{
     oct_coords::{GridMode, GRID_MASK},
 };
 
-pub const BINDINGS_HANDLE: Handle<Shader> = weak_handle!("41cdb8d9-25b9-4401-9986-33c19d184969");
-pub const FRAGMENT_HANDLE: Handle<Shader> = weak_handle!("a7a24f93-e6a5-4ff0-b9c8-caf8c1c0cd97");
-pub const SHARED_HANDLE: Handle<Shader> = weak_handle!("4ad87b7e-0802-4fd0-aa65-7de1474fd6bf");
-pub const VERTEX_HANDLE: Handle<Shader> = weak_handle!("a3511116-2c4e-4f43-b69a-7c9391eaab54");
+pub const BINDINGS_HANDLE: Handle<Shader> = uuid_handle!("41cdb8d9-25b9-4401-9986-33c19d184969");
+pub const FRAGMENT_HANDLE: Handle<Shader> = uuid_handle!("a7a24f93-e6a5-4ff0-b9c8-caf8c1c0cd97");
+pub const SHARED_HANDLE: Handle<Shader> = uuid_handle!("4ad87b7e-0802-4fd0-aa65-7de1474fd6bf");
+pub const VERTEX_HANDLE: Handle<Shader> = uuid_handle!("a3511116-2c4e-4f43-b69a-7c9391eaab54");
 
 pub const RENDER_MULTISAMPLE_FLAG: u32 = 16;
 pub const INDEXED_FLAG: u32 = 32;

@@ -9,7 +9,7 @@ use std::{
 };
 
 use bevy::{
-    asset::{load_internal_asset, weak_handle},
+    asset::{load_internal_asset, uuid_handle},
     core_pipeline::{
         core_3d::{AlphaMask3d, Opaque3d, Opaque3dBatchSetKey, Opaque3dBinKey, Transparent3d},
         prepass::{OpaqueNoLightmap3dBatchSetKey, OpaqueNoLightmap3dBinKey},
@@ -99,12 +99,12 @@ pub struct ImposterBakePlugin;
 pub struct ImposterBakeGraph;
 
 pub const STANDARD_BAKE_HANDLE: Handle<Shader> =
-    weak_handle!("ed669393-0761-4654-b575-d0cba4988181");
+    uuid_handle!("ed669393-0761-4654-b575-d0cba4988181");
 pub const IMPOSTER_BAKE_HANDLE: Handle<Shader> =
-    weak_handle!("7e8a809d-d90b-4a8d-9a17-698cb3574c58");
-pub const SHARED_HANDLE: Handle<Shader> = weak_handle!("6f9a816c-9b58-4776-a51e-95fd96e9b29b");
+    uuid_handle!("7e8a809d-d90b-4a8d-9a17-698cb3574c58");
+pub const SHARED_HANDLE: Handle<Shader> = uuid_handle!("6f9a816c-9b58-4776-a51e-95fd96e9b29b");
 pub const IMPOSTER_BLIT_HANDLE: Handle<Shader> =
-    weak_handle!("c1727f8d-f6b7-4d56-b15d-605ecccf13fb");
+    uuid_handle!("c1727f8d-f6b7-4d56-b15d-605ecccf13fb");
 
 impl Plugin for ImposterBakePlugin {
     fn build(&self, app: &mut App) {
@@ -540,7 +540,7 @@ pub struct ImposterBakeBundle {
     pub transform: Transform,
     pub global_transform: GlobalTransform,
     pub complete: ImposterBakeCompleteChannel,
-    pub _sync: SyncToRenderWorld,
+    pub sync: SyncToRenderWorld,
 }
 
 impl Default for ImposterBakeBundle {
@@ -553,7 +553,7 @@ impl Default for ImposterBakeBundle {
             transform: Default::default(),
             global_transform: Default::default(),
             complete: Default::default(),
-            _sync: Default::default(),
+            sync: Default::default(),
         }
     }
 }
