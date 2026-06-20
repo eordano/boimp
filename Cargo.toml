@@ -32,8 +32,8 @@ pico-args = "0.5.0"
 rand = "0.8.5"
 bevy = { version = "0.19", default-features = true }
 
-# Build against the local DCL bevy fork (release-0.19-dcl). boimp relies on
+# Build against the DCL bevy fork (release-0.19-dcl). boimp relies on
 # DCL-fork-only APIs (e.g. RenderAssetTransferPriority / Image::transfer_priority)
 # that are not present in upstream crates.io bevy 0.19.
 [patch.crates-io]
-bevy = { path = "/home/dcl/bevy-fork" }
+bevy = { git = "https://github.com/eordano/bevy", branch = "release-0.19-dcl" }

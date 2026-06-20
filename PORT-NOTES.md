@@ -1,11 +1,11 @@
 # boimp: Bevy 0.18 → 0.19 port notes
 
 Branch: `0.19` (off `0.18`).
-Target: DCL bevy fork at `/home/dcl/bevy-fork`, branch `release-0.19-dcl`
+Target: the DCL bevy fork, branch `release-0.19-dcl`
 (resolves **wgpu 29.0.3**).
 
 **Status:** the **library builds clean** against the fork
-(`dcl-shell -c "cargo build"`). Several `examples/` do *not* build — they depend
+(`cargo build`). Several `examples/` do *not* build — they depend
 on bevy subsystems that 0.19 reworked outside the scope of the imposter port
 (scene spawning, ambient light, messages); see "Examples (not ported)" below.
 
@@ -146,11 +146,11 @@ that downstreams consume builds clean.
 
 Branch: `0.17` (off `feat/composite-bake-via-storage-texture`).
 
-boimp is built against the **DCL bevy fork** (`/home/dcl/bevy-fork`, branch
+boimp is built against the **DCL bevy fork** (branch
 `release-0.17-dcl`), not crates.io bevy, because it depends on DCL-fork-only
 APIs (see "Fork dependencies" below). `Cargo.toml` bumps `bevy` to `0.17`,
-`wgpu` to `25`, and adds a `[patch.crates-io] bevy = { path =
-"/home/dcl/bevy-fork" }`.
+`wgpu` to `25`, and adds a `[patch.crates-io] bevy = { git = ... }` pointing at
+the DCL bevy fork.
 
 ## Render-API changes made
 
@@ -252,7 +252,7 @@ material(3)]` (was `[view(0), mesh(1), material(2)]`), and
 - `weak_handle!` and `load_internal_asset!` still exist.
 - `ExtractedView` / `ExtractedCamera` field shapes unchanged.
 
-## Fork dependencies — REQUIRED changes to `/home/dcl/bevy-fork`
+## Fork dependencies — REQUIRED changes to the DCL bevy fork
 
 boimp cannot finish compiling against the fork until these land:
 
@@ -349,5 +349,5 @@ Added `depth_slice: None` to the `wgpu::RenderPassColorAttachment` literal in
   `window.cursor_options.*` (helpers/camera_controller.rs).
 
 ### Status
-GREEN. `dcl-shell -c "cd /home/dcl/boimp-fork && cargo build"` succeeds; the
+GREEN. `cargo build` succeeds; the
 earlier "fork mid-merge" blocker noted above is resolved.
