@@ -15,7 +15,7 @@ bevy = { git = "https://github.com/robtfm/bevy", branch = "release-0.16-dcl", de
 wgpu = "24"
 crossbeam-channel = "*"
 async-channel = "*"
-image = "*"
+image = { version = "*", default-features = false, features = ["png"] }
 bytemuck = "*"
 
 # asset loader
